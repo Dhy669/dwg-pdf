@@ -1,0 +1,28 @@
+# Build outputs
+bin/
+obj/
+*.dll
+*.pdb
+
+# AutoCAD/runtime artifacts
+*.log
+*.err
+batchjob.json
+run.scr
+*.bak
+*.sv$
+*.ac$
+
+# Input and generated drawings/documents
+*.dwg
+*.dwl
+*.dwl2
+*.pdf
+
+# IDE and OS files
+.vs/
+.vscode/
+*.user
+*.suo
+.DS_Store
+Thumbs.db
