@@ -16,6 +16,19 @@ param(
   [switch]$SkipBuild
 )
 $ErrorActionPreference = 'Stop'
+
+# A force-closed host can leave an inaccessible accoreconsole.exe behind. Some
+# installations keep such a process as a harmless shell, and new core-console
+# jobs can still run beside it. Report it once but never block every DWG merely
+# because Windows refuses to terminate that unrelated process.
+Get-CimInstance Win32_Process -Filter "Name='accoreconsole.exe'" -ErrorAction SilentlyContinue |
+  ForEach-Object {
+    $parent = Get-Process -Id $_.ParentProcessId -ErrorAction SilentlyContinue
+    if (-not $parent) {
+      Write-Warning "Ignoring orphaned accoreconsole.exe PID $($_.ProcessId); starting a new task."
+    }
+  }
+
 $bin = Join-Path $PSScriptRoot 'DwgBatchPdf\bin\Release'
 $pluginDll = Join-Path $bin 'DwgBatchPdf.dll'
 $sourceFiles = @(
@@ -87,6 +100,10 @@ if (-not (Test-Path -LiteralPath $seed -PathType Leaf)) {
 if ([IO.Path]::GetExtension($seed) -ne '.dwg') {
   throw "ExactFilePath must point to a .dwg file: $seed"
 }
+# AutoCAD 2018 core console terminates natively when its current document is the
+# bundled IRD.dwt and the plugin creates the first side Database. Use the target
+# DWG as the host document; this is the stable path for this installation. The
+# plugin still uses side databases when processing a different document.
 $quotedSeed = '"' + $seed + '"'
 $quotedScript = '"' + (Join-Path $runtime 'run.scr') + '"'
 $completed = $false
@@ -98,10 +115,28 @@ for ($attempt = 1; $attempt -le 2 -and -not $completed -and -not $timedOut; $att
     -ArgumentList @('/i', $quotedSeed, '/s', $quotedScript, '/l', 'en-US') `
     -RedirectStandardOutput $consoleOut -RedirectStandardError $consoleErr `
     -PassThru -WindowStyle Hidden
+  # MaxMinutes is an inactivity timeout, not a total-file timeout. Large DWGs
+  # can legitimately need more than five minutes when every detected sheet is
+  # plotted. Refresh the deadline whenever the plugin trace/log or console
+  # output advances; only a process making no observable progress is killed.
+  $progressFiles = @(
+    (Join-Path $runtime 'trace.log'),
+    $runtimeLog,
+    $consoleOut,
+    $consoleErr
+  )
+  $lastProgressStamp = [DateTime]::MinValue
   $deadline = (Get-Date).AddMinutes($MaxMinutes)
   while (-not $core.HasExited -and (Get-Date) -lt $deadline) {
     Start-Sleep -Seconds 2
     $core.Refresh()
+    $progressStamp = $progressFiles | Where-Object { Test-Path -LiteralPath $_ } |
+      ForEach-Object { (Get-Item -LiteralPath $_).LastWriteTimeUtc } |
+      Sort-Object -Descending | Select-Object -First 1
+    if ($progressStamp -and $progressStamp -gt $lastProgressStamp) {
+      $lastProgressStamp = $progressStamp
+      $deadline = (Get-Date).AddMinutes($MaxMinutes)
+    }
     if (Test-Path $runtimeLog) {
       $completed = [bool](Select-String -LiteralPath $runtimeLog -Pattern '^Finished:' -Quiet)
       if ($completed) {
@@ -140,7 +175,14 @@ if (Test-Path $runtimeLog) {
   ) | Set-Content -LiteralPath $workspaceLog -Encoding UTF8
 }
 if ($timedOut) {
-  "TIMEOUT after $MaxMinutes minutes: $seed" | Add-Content -LiteralPath $workspaceLog -Encoding UTF8
+  "TIMEOUT after $MaxMinutes minutes without progress: $seed" | Add-Content -LiteralPath $workspaceLog -Encoding UTF8
+}
+# A completed AutoCAD command can still report failed DWGs in its own log.
+# Treat that as a non-zero run so run-all.ps1 records and can retry the file;
+# previously files with zero generated PDFs were incorrectly counted as OK.
+if ($coreExit -eq 0 -and (Test-Path -LiteralPath $runtimeLog)) {
+  $pluginFailed = Select-String -LiteralPath $runtimeLog -Pattern 'failed DWGs=[1-9][0-9]*' -Quiet
+  if ($pluginFailed) { $coreExit = 2 }
 }
 if ($coreExit -ne 0) { throw "accoreconsole failed with exit code $coreExit. See $workspaceLog" }
 if (-not (Test-Path $runtimeLog)) { throw "Plugin did not run; batch.log was not created." }

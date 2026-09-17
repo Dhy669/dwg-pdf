@@ -7,6 +7,8 @@ param(
   [string]$DetectionMode = 'BlockOnly',
   [ValidateSet(0,1)]
   [int]$DebugFrames = 0,
+  [ValidateRange(1,60)]
+  [int]$MaxMinutes = 5,
   [switch]$IncludeRecoveryFiles
 )
 $ErrorActionPreference = 'Continue'
@@ -31,9 +33,11 @@ for ($i = 0; $i -lt $files.Count; $i++) {
   $progressLine = "[$($i+1)/$($files.Count)] $($f.FullName)"
   Write-Host $progressLine
   $progressLine | Add-Content -LiteralPath $log
-  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'run.ps1') -InputRoot $InputRoot -OutputRoot $OutputRoot -ExactFilePath $f.FullName -MinFrameArea $MinFrameArea -MaxFrameArea $MaxFrameArea -DetectionMode $DetectionMode -DebugFrames $DebugFrames -SkipBuild
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'run.ps1') -InputRoot $InputRoot -OutputRoot $OutputRoot -ExactFilePath $f.FullName -MinFrameArea $MinFrameArea -MaxFrameArea $MaxFrameArea -DetectionMode $DetectionMode -DebugFrames $DebugFrames -MaxMinutes $MaxMinutes -SkipBuild
   if ($LASTEXITCODE -eq 0) { $ok++ } else { $failed++; "FAILED: $($f.FullName) exit=$LASTEXITCODE" | Add-Content -LiteralPath $log }
-  Get-Process accoreconsole -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+  # run.ps1 owns and terminates the exact process that it starts. Killing every
+  # accoreconsole instance here can terminate another retry/user task and leaves
+  # inaccessible orphan processes behind, causing misleading failures later.
   Start-Sleep -Seconds 2
 }
 "Finished: $(Get-Date -Format s); OK=$ok; Failed=$failed" | Add-Content -LiteralPath $log
