@@ -98,7 +98,6 @@ namespace DwgBatchPdf
                 // fallback here, after NETLOAD but before that open. FONTALT is
                 // read-only to an AutoCAD 2018 .scr file and putting it in run.scr
                 // aborts the script before this command can start.
-                try { Application.SetSystemVariable("FONTALT", "simsun.ttc"); } catch { }
                 try { Application.SetSystemVariable("TEXTFILL", 1); } catch { }
                 Directory.CreateDirectory(job.OutputRoot);
                 SearchOption option = job.Recurse ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
@@ -2248,95 +2247,122 @@ namespace DwgBatchPdf
 
         private static void PrepareMissingFonts(Database db, StringBuilder log)
         {
-            int replaced = 0;
-            try { Application.SetSystemVariable("FONTALT", "simsun.ttc"); } catch { }
+            int replacedMain=0,replacedBig=0,replacedInline=0,literalQuestions=0;
             try { Application.SetSystemVariable("TEXTFILL", 1); } catch { }
-            string winFonts=Environment.GetFolderPath(Environment.SpecialFolder.Fonts);
-            string acadFonts=Path.Combine(Path.GetDirectoryName(typeof(Database).Assembly.Location),"Fonts");
+            List<string> fontDirs=FontSearchDirectories(db);
             using (Transaction tr = db.TransactionManager.StartTransaction())
             {
                 TextStyleTable styles = (TextStyleTable)tr.GetObject(db.TextStyleTableId, OpenMode.ForRead);
                 foreach (ObjectId id in styles)
                 {
                     TextStyleTableRecord style = (TextStyleTableRecord)tr.GetObject(id, OpenMode.ForRead);
-                    bool missingMain=!FontExists(style.FileName,winFonts,acadFonts);
+                    string typeFace=string.Empty;
+                    try { typeFace=style.Font.TypeFace??string.Empty; } catch { }
+                    // TTF-backed AutoCAD styles commonly keep FileName empty and
+                    // store the installed family in Font.TypeFace. Do not mistake
+                    // those valid styles for a missing font.
+                    bool hasTypeFace=!string.IsNullOrWhiteSpace(typeFace);
+                    // A valid Windows TypeFace is sufficient even when the stale
+                    // filename says SimSun.ttf while Windows actually provides
+                    // simsun.ttc. Conversely an extensionless token such as
+                    // O8116901 with no TypeFace is a missing custom CAD font, not
+                    // an installed family.
+                    bool missingMain=hasTypeFace ? false : !FontExists(style.FileName,fontDirs);
                     bool missingBig=!string.IsNullOrWhiteSpace(style.BigFontFileName) &&
-                        !FontExists(style.BigFontFileName,winFonts,acadFonts);
+                        !FontExists(style.BigFontFileName,fontDirs);
                     bool isShx=!string.IsNullOrWhiteSpace(style.FileName) &&
                         style.FileName.EndsWith(".shx",StringComparison.OrdinalIgnoreCase);
-                    // A present SHX file is not sufficient for legacy Chinese
-                    // text: without a usable big font AutoCAD renders the encoded
-                    // characters as ???. Normalize every SHX style to a known
-                    // main/big-font pair, not only styles whose files are absent.
-                    bool needsChineseBig=isShx && !string.Equals(style.BigFontFileName,"gbcbig.shx",StringComparison.OrdinalIgnoreCase);
-                    bool normalizeTrueType=!isShx && !style.IsShapeFile &&
-                        !string.Equals(Path.GetFileName(style.FileName),"simsun.ttc",StringComparison.OrdinalIgnoreCase);
-                    bool normalizeShx=isShx && (!string.Equals(Path.GetFileName(style.FileName),"txt.shx",StringComparison.OrdinalIgnoreCase) || needsChineseBig);
-                    if(!missingMain && !missingBig && !normalizeTrueType && !normalizeShx) continue;
+                    log.AppendLine("FONT STYLE name="+style.Name+" typeface="+typeFace+" main="+(style.FileName??"")+" ["+
+                        (missingMain?"MISSING":"FOUND")+"] big="+(style.BigFontFileName??"")+" ["+
+                        (string.IsNullOrWhiteSpace(style.BigFontFileName)?"NONE":(missingBig?"MISSING":"FOUND"))+"]");
+                    if(!missingMain && !missingBig) continue;
                     style.UpgradeOpen();
-                    // Keep working SHX/big-font styles intact. Clearing every
-                    // BigFontFileName destroyed legacy Chinese code-page mapping
-                    // and produced literal question marks in otherwise valid text.
-                    if(normalizeTrueType)
+                    if(missingMain)
                     {
+                        style.FileName=(isShx || style.IsShapeFile)?"txt.shx":"simsun.ttc";
+                        replacedMain++;
+                    }
+                    if(missingBig)
+                    {
+                        // BigFont encodings are not interchangeable (hzfs.shx is
+                        // not compatible with gbcbig.shx). AutoCAD exposes the
+                        // decoded text to .NET, so use a Unicode TTF fallback when
+                        // the original BigFont is unavailable.
                         style.FileName="simsun.ttc";
                         style.BigFontFileName=string.Empty;
+                        replacedBig++;
                     }
-                    else if(isShx)
-                    {
-                        style.FileName="txt.shx";
-                        style.BigFontFileName="gbcbig.shx";
-                    }
-                    else if(missingMain)
-                    {
-                        style.FileName="simsun.ttc";
-                    }
-                    if((missingBig || needsChineseBig) && isShx) style.BigFontFileName="gbcbig.shx";
-                    replaced++;
                 }
-                // MText can override its text style with inline \F...; codes. Remove
-                // those overrides so the default font above is actually used.
                 BlockTable blocks = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
                 foreach (ObjectId blockId in blocks)
                 {
                     BlockTableRecord block = (BlockTableRecord)tr.GetObject(blockId, OpenMode.ForRead);
                     foreach (ObjectId entityId in block)
                     {
-                        MText mt = tr.GetObject(entityId, OpenMode.ForRead, false) as MText;
-                        if (mt == null || string.IsNullOrEmpty(mt.Contents)) continue;
-                        // Always remove inline font overrides. A referenced font may
-                        // physically exist yet lack the glyphs/code-page required by
-                        // a Chinese title block, which still renders as ???? despite
-                        // the table style having been normalized successfully.
-                        string clean = Regex.Replace(mt.Contents,@"\\[fF]([^;|]*)(?:\|[^;]*)?;",string.Empty);
-                        if (clean == mt.Contents) continue;
                         try
                         {
+                            Entity entity=tr.GetObject(entityId,OpenMode.ForRead,false) as Entity;
+                            if(entity==null) continue;
+                            DBText text=entity as DBText;
+                            if(text!=null && Regex.IsMatch(text.TextString??"",@"\?{2,}")) literalQuestions++;
+                            MText mt=entity as MText;
+                            if(mt==null || string.IsNullOrEmpty(mt.Contents)) continue;
+                            if(Regex.IsMatch(mt.Text??"",@"\?{2,}")) literalQuestions++;
+                            string fixedContents=Regex.Replace(mt.Contents,@"\\([fF])([^;|]*)(\|[^;]*)?;",
+                                delegate(Match match)
+                                {
+                                    string inlineFont=match.Groups[2].Value.Trim();
+                                    if(string.IsNullOrWhiteSpace(Path.GetExtension(inlineFont)) || FontExists(inlineFont,fontDirs))
+                                        return match.Value;
+                                    replacedInline++;
+                                    return "\\"+match.Groups[1].Value+"SimSun"+match.Groups[3].Value+";";
+                                });
+                            if(fixedContents==mt.Contents) continue;
                             LayerTableRecord layer=(LayerTableRecord)tr.GetObject(mt.LayerId,OpenMode.ForRead);
                             if(layer.IsLocked) continue;
                             mt.UpgradeOpen();
-                            mt.Contents = clean;
+                            mt.Contents=fixedContents;
                         }
                         catch(Autodesk.AutoCAD.Runtime.Exception ex)
                         {
-                            // Font substitution is best-effort. A locked layer
-                            // must never prevent the DWG and all its sheets from
-                            // being exported.
                             if(ex.ErrorStatus!=ErrorStatus.OnLockedLayer) throw;
                         }
                     }
                 }
                 tr.Commit();
             }
-            log.AppendLine("MISSING FONTS SUBSTITUTED ["+replaced+"] -> simsun.ttc / txt.shx+gbcbig.shx");
+            log.AppendLine("FONT PREFLIGHT replaced-main="+replacedMain+" replaced-big="+replacedBig+
+                " replaced-inline="+replacedInline+" literal-question-mark-entities="+literalQuestions);
+            if(literalQuestions>0)
+                log.AppendLine("WARN UNRECOVERABLE_LITERAL_QUESTION_MARK: source text already contains ??; substitution cannot reconstruct it.");
         }
 
-        private static bool FontExists(string font, string winFonts, string acadFonts)
+        private static List<string> FontSearchDirectories(Database db)
         {
-            if (string.IsNullOrWhiteSpace(font)) return false;
-            if (Path.IsPathRooted(font) && File.Exists(font)) return true;
-            string name = Path.GetFileName(font);
-            return File.Exists(Path.Combine(winFonts, name)) || File.Exists(Path.Combine(acadFonts, name));
+            var dirs=new List<string> {
+                Environment.GetFolderPath(Environment.SpecialFolder.Fonts),
+                Path.Combine(Path.GetDirectoryName(typeof(Database).Assembly.Location),"Fonts"),
+                Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location),"Fonts")
+            };
+            string assemblyDir=Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+            DirectoryInfo cursor=new DirectoryInfo(assemblyDir);
+            for(int i=0;i<4 && cursor!=null;i++,cursor=cursor.Parent)
+                dirs.Add(Path.Combine(cursor.FullName,"Fonts"));
+            if(!string.IsNullOrWhiteSpace(db.Filename)) dirs.Add(Path.GetDirectoryName(db.Filename));
+            string acad=Environment.GetEnvironmentVariable("ACAD")??string.Empty;
+            dirs.AddRange(acad.Split(new[]{';'},StringSplitOptions.RemoveEmptyEntries));
+            return dirs.Where(x=>!string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
+        private static bool FontExists(string font,IEnumerable<string> directories)
+        {
+            if(string.IsNullOrWhiteSpace(font)) return false;
+            if(Path.IsPathRooted(font) && File.Exists(font)) return true;
+            string name=Path.GetFileName(font);
+            if(!string.IsNullOrWhiteSpace(Path.GetExtension(name)))
+                return directories.Any(dir=>File.Exists(Path.Combine(dir,name)));
+            string[] extensions={string.Empty,".shx",".ttf",".ttc",".otf"};
+            return directories.Any(dir=>extensions.Any(ext=>File.Exists(Path.Combine(dir,name+ext))));
         }
 
         private static void CollectRectangles(BlockTableRecord space, Transaction tr, Matrix3d transform, int depth, double minW, double minH, List<Frame> rectangles, List<LineSegment> segments, List<Point2d> textPoints)
@@ -2881,7 +2907,19 @@ namespace DwgBatchPdf
                         PlotPaperSpaceWindow(db,layoutId,frame,output);
                     }
                 }
-                else PlotFrameThroughPaperViewport(db, frame, output);
+                else
+                {
+                    // AutoCAD 2018 has a native access-violation bug when a small
+                    // legacy/model-space drawing is regenerated through a newly
+                    // created PaperSpace viewport.  Plot the current model display
+                    // directly for ordinary millimetre-sized, axis-aligned sheets;
+                    // this still uses the detected outer frame as the display view
+                    // and avoids creating the crashing temporary viewport.
+                    bool safeDirectDisplay=Math.Abs(frame.Angle)<1e-8 &&
+                        frame.Width<=5000 && frame.Height<=5000;
+                    if(safeDirectDisplay) PlotModelFrameDirect(db,frame,output);
+                    else PlotFrameThroughPaperViewport(db, frame, output);
+                }
                 return;
             }
             bool isModel = IsModelLayout(db, layoutId);
@@ -3303,6 +3341,127 @@ namespace DwgBatchPdf
             catch { return false; }
         }
 
+        private static void PlotModelFrameDirect(Database db,Frame frame,string output)
+        {
+            Trace("model isolated display: enter");
+            // AutoCAD 2018 core console rejects both View and Window plot types
+            // for some legacy model drawings. Display is stable, so temporarily
+            // hide entities assigned to neighbouring sheets. The virtual display
+            // may be wider than this frame, but that extra area is then empty.
+            List<ObjectId> hidden=HideModelEntitiesOutsideFrame(db,frame);
+            try
+            {
+                SetModelFrameView(db,frame);
+            db.TileMode=true;
+            LayoutManager.Current.CurrentLayout="Model";
+            ObjectId modelLayoutId;
+            using(Transaction tr=db.TransactionManager.StartOpenCloseTransaction())
+            {
+                DBDictionary layouts=(DBDictionary)tr.GetObject(db.LayoutDictionaryId,OpenMode.ForRead);
+                modelLayoutId=layouts.GetAt("Model");
+                tr.Commit();
+            }
+            using(var ps=new PlotSettings(true))
+            {
+                // AutoCAD 2018 rejects PlotType.View on a pristine model
+                // PlotSettings object (eInvalidInput). Seed it from the active
+                // Model layout so the validator has a valid model plot context.
+                using(Transaction tr=db.TransactionManager.StartOpenCloseTransaction())
+                {
+                    Layout modelLayout=(Layout)tr.GetObject(modelLayoutId,OpenMode.ForRead);
+                    ps.CopyFrom(modelLayout);
+                    tr.Commit();
+                }
+                PlotSettingsValidator v=PlotSettingsValidator.Current;
+                v.SetPlotConfigurationName(ps,"DWG To PDF.pc3",null);
+                v.RefreshLists(ps);
+                v.SetPlotType(ps,Autodesk.AutoCAD.DatabaseServices.PlotType.Display);
+                v.SetUseStandardScale(ps,true);
+                v.SetStdScaleType(ps,StdScaleType.ScaleToFit);
+                v.SetPlotCentered(ps,true);
+                v.SetCurrentStyleSheet(ps,"monochrome.ctb");
+                ps.ShadePlot=PlotSettingsShadePlotType.Wireframe;
+                ps.PlotHidden=false;
+                ps.PlotPlotStyles=true;
+                ps.ShowPlotStyles=true;
+                ps.PrintLineweights=true;
+                ps.PlotTransparency=true;
+                SelectMedia(ps,v,frame);
+                bool paperLandscape=ps.PlotPaperSize.X>=ps.PlotPaperSize.Y;
+                v.SetPlotRotation(ps,paperLandscape==(frame.Width>=frame.Height)
+                    ? PlotRotation.Degrees000 : PlotRotation.Degrees090);
+                var info=new PlotInfo { Layout=modelLayoutId,OverrideSettings=ps };
+                new PlotInfoValidator { MediaMatchingPolicy=MatchingPolicy.MatchEnabled }.Validate(info);
+                using(PlotEngine pe=PlotFactory.CreatePublishEngine())
+                using(var dlg=new PlotProgressDialog(false,1,true))
+                {
+                    dlg.OnBeginPlot(); pe.BeginPlot(dlg,null);
+                    pe.BeginDocument(info,Path.GetFileNameWithoutExtension(output),null,1,true,output);
+                    pe.BeginPage(new PlotPageInfo(),info,true,null);
+                    pe.BeginGenerateGraphics(null); pe.EndGenerateGraphics(null);
+                    pe.EndPage(null); pe.EndDocument(null); pe.EndPlot(null); dlg.OnEndPlot();
+                }
+            }
+                Trace("model isolated display: plot completed hidden="+hidden.Count);
+            }
+            finally
+            {
+                RestoreModelEntityVisibility(db,hidden);
+                try { Application.DocumentManager.MdiActiveDocument.Editor.Regen(); } catch { }
+            }
+        }
+
+        private static List<ObjectId> HideModelEntitiesOutsideFrame(Database db,Frame frame)
+        {
+            var hidden=new List<ObjectId>();
+            double minX=frame.Center.X-frame.Width/2.0;
+            double maxX=frame.Center.X+frame.Width/2.0;
+            double minY=frame.Center.Y-frame.Height/2.0;
+            double maxY=frame.Center.Y+frame.Height/2.0;
+            double tolerance=Math.Max(frame.Width,frame.Height)*.0002;
+            using(Transaction tr=db.TransactionManager.StartTransaction())
+            {
+                BlockTable table=(BlockTable)tr.GetObject(db.BlockTableId,OpenMode.ForRead);
+                BlockTableRecord model=(BlockTableRecord)tr.GetObject(table[BlockTableRecord.ModelSpace],OpenMode.ForRead);
+                foreach(ObjectId id in model)
+                {
+                    Entity entity=tr.GetObject(id,OpenMode.ForRead,false) as Entity;
+                    if(entity==null || !entity.Visible) continue;
+                    bool belongs=false;
+                    try
+                    {
+                        Extents3d ext=entity.GeometricExtents;
+                        double cx=(ext.MinPoint.X+ext.MaxPoint.X)/2.0;
+                        double cy=(ext.MinPoint.Y+ext.MaxPoint.Y)/2.0;
+                        belongs=cx>=minX-tolerance && cx<=maxX+tolerance &&
+                                cy>=minY-tolerance && cy<=maxY+tolerance;
+                    }
+                    catch { belongs=true; }
+                    if(belongs) continue;
+                    entity.UpgradeOpen();
+                    entity.Visible=false;
+                    hidden.Add(id);
+                }
+                tr.Commit();
+            }
+            return hidden;
+        }
+
+        private static void RestoreModelEntityVisibility(Database db,List<ObjectId> hidden)
+        {
+            if(hidden==null || hidden.Count==0) return;
+            using(Transaction tr=db.TransactionManager.StartTransaction())
+            {
+                foreach(ObjectId id in hidden)
+                {
+                    if(id.IsNull || id.IsErased || !id.IsValid) continue;
+                    Entity entity=tr.GetObject(id,OpenMode.ForWrite,false) as Entity;
+                    if(entity!=null) entity.Visible=true;
+                }
+                tr.Commit();
+            }
+        }
+
         private static void PlotFrameThroughPaperViewport(Database db, Frame frame, string output)
         {
             Trace("paper viewport: enter");
@@ -3544,9 +3703,12 @@ namespace DwgBatchPdf
                 view.ViewDirection = Vector3d.ZAxis;
                 view.Target = new Point3d(frame.Center.X, frame.Center.Y, 0);
                 view.CenterPoint = Point2d.Origin;
-                view.Width = frame.Width * 1.01;
-                view.Height = frame.Height * 1.01;
-                view.ViewTwist = frame.Angle;
+                // Keep only a numerical/half-lineweight allowance. The previous
+                // one-percent expansion visibly included part of an adjacent
+                // touching sheet.
+                view.Width = frame.Width * 1.0005;
+                view.Height = frame.Height * 1.0005;
+                view.ViewTwist = -frame.Angle;
                 tr.Commit();
             }
             return name;
