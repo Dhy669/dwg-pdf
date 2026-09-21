@@ -17,6 +17,36 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
+foreach ($pathArgument in @(
+  @{ Name = 'InputRoot'; Value = $InputRoot },
+  @{ Name = 'OutputRoot'; Value = $OutputRoot }
+)) {
+  $value = [string]$pathArgument.Value
+  if ([string]::IsNullOrWhiteSpace($value) -or
+      $value.IndexOfAny([IO.Path]::GetInvalidPathChars()) -ge 0 -or
+      $value.Contains("`r") -or $value.Contains("`n")) {
+    throw "$($pathArgument.Name) contains an illegal or embedded newline character. Use run-22.ps1 or assign the path from Get-Item."
+  }
+}
+
+# Fail before creating a runtime directory when a path was damaged while being
+# pasted into the console.  In particular, a wrapped Chinese path can contain a
+# real CR/LF even though it looks like harmless terminal line wrapping.  Never
+# silently turn that into an empty ExactFilePath and process the first DWG.
+if (-not [string]::IsNullOrWhiteSpace($ExactFilePath)) {
+  if ($ExactFilePath.IndexOfAny([IO.Path]::GetInvalidPathChars()) -ge 0 -or
+      $ExactFilePath.Contains("`r") -or $ExactFilePath.Contains("`n")) {
+    throw 'ExactFilePath contains an illegal or embedded newline character. Use -FileNameFilter with a narrower InputRoot, or assign the path from Get-ChildItem.'
+  }
+  $ExactFilePath = [IO.Path]::GetFullPath($ExactFilePath.Trim())
+  if (-not (Test-Path -LiteralPath $ExactFilePath -PathType Leaf)) {
+    throw "ExactFilePath does not exist: $ExactFilePath"
+  }
+  if ([IO.Path]::GetExtension($ExactFilePath) -ine '.dwg') {
+    throw "ExactFilePath must point to a .dwg file: $ExactFilePath"
+  }
+}
+
 # A force-closed host can leave an inaccessible accoreconsole.exe behind. Some
 # installations keep such a process as a harmless shell, and new core-console
 # jobs can still run beside it. Report it once but never block every DWG merely
@@ -56,6 +86,25 @@ $runtime = Join-Path $env:TEMP $runtimeName
 New-Item -ItemType Directory -Force -Path $runtime | Out-Null
 Copy-Item $pluginDll (Join-Path $runtime 'DwgBatchPdf.dll') -Force
 Copy-Item (Join-Path $bin 'DwgBatchPdf.pdb') (Join-Path $runtime 'DwgBatchPdf.pdb') -Force
+$runtimeFonts = Join-Path $runtime 'Fonts'
+New-Item -ItemType Directory -Force -Path $runtimeFonts | Out-Null
+# Legacy SHX/BigFont text is decoded while AutoCAD opens the DWG, before the
+# managed plugin can inspect or replace a text style. Stage only genuine project
+# fonts in an isolated support directory. Never rename a different BigFont as a
+# substitute: custom SHX character maps are not interchangeable and false aliases
+# can silently remove every annotation that uses them.
+$projectFonts = Join-Path $PSScriptRoot 'Fonts'
+if (Test-Path -LiteralPath $projectFonts) {
+  Get-ChildItem -LiteralPath $projectFonts -File -ErrorAction SilentlyContinue |
+    ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $runtimeFonts -Force }
+}
+# Start-Process inherits this only inside the current powershell.exe invocation;
+# it does not alter the user's permanent AutoCAD profile.
+$env:ACAD = if ([string]::IsNullOrWhiteSpace($env:ACAD)) {
+  $runtimeFonts
+} else {
+  $runtimeFonts + ';' + $env:ACAD
+}
 $runtimeLog = Join-Path $runtime 'batch.log'
 $consoleOut = Join-Path $runtime 'accoreconsole.out.log'
 $consoleErr = Join-Path $runtime 'accoreconsole.err.log'
@@ -90,7 +139,7 @@ BATCHDWGTOPDF
 QUIT
 "@
 $script | Set-Content (Join-Path $runtime 'run.scr') -Encoding ASCII
-$seed = if ($ExactFilePath) { [IO.Path]::GetFullPath($ExactFilePath) } else { Get-ChildItem -LiteralPath $InputRoot -Recurse -File -Filter $FileNameFilter | Select-Object -First 1 -ExpandProperty FullName }
+$seed = if ($ExactFilePath) { $ExactFilePath } else { Get-ChildItem -LiteralPath $InputRoot -Recurse -File -Filter $FileNameFilter | Select-Object -First 1 -ExpandProperty FullName }
 if (-not $seed) { throw "No DWG found under: $InputRoot" }
 if (-not (Test-Path -LiteralPath $seed -PathType Leaf)) { throw "DWG file does not exist: $seed" }
 if ([IO.Path]::GetExtension($seed) -ine '.dwg') { throw "Input file is not a DWG: $seed" }

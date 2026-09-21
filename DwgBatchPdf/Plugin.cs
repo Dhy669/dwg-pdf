@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Reflection;
 using System.Text;
@@ -318,6 +319,7 @@ namespace DwgBatchPdf
                 !string.Equals(Path.GetFullPath(activeFile), Path.GetFullPath(path), StringComparison.OrdinalIgnoreCase);
             if (opened) doc = docs.Open(path, false);
             if (opened) docs.MdiActiveDocument = doc;
+            int validCount=0;
             try
             {
                 // ProcessSideDwg detects through a side database but plots the
@@ -338,10 +340,20 @@ namespace DwgBatchPdf
                         int sameLayoutIndex = sheets.Take(i + 1).Count(s => s.Key == sheet.Key) - 1;
                         string output = AvailableOutputPath(OutputPath(path, job, sheet.Key, sameLayoutIndex, sameLayoutCount, sheet.Value));
                     if (job.Overwrite || !File.Exists(output)) Plot(doc.Database, layoutId, sheet.Value, output);
+                    string blankReason;
+                    if(IsLikelyBlankPlot(output,out blankReason))
+                    {
+                        try { if(File.Exists(output)) File.Delete(output); } catch { }
+                        log.AppendLine("SKIP EMPTY SIDE FRAME "+(i+1)+" "+path+" / "+blankReason);
+                    }
+                    else validCount++;
                 }
             }
             finally { if (opened) doc.CloseAndDiscard(); }
-            return sheets.Count;
+            if(validCount!=sheets.Count)
+                log.AppendLine("ALERT PDF COUNT MISMATCH: detected frames="+sheets.Count+
+                    ", generated PDFs="+validCount+" / "+path);
+            return validCount;
         }
 
         private static int ProcessActiveDwg(Database db, string path, Job job, StringBuilder log)
@@ -431,6 +443,24 @@ namespace DwgBatchPdf
                 }
                 tr.Commit();
             }
+            // When complete PaperSpace sheets exist, an unlabelled repeated-frame
+            // family found in ModelSpace is normally the same model geometry seen
+            // through those layouts (or an internal module family). Keep named or
+            // independently titled ModelSpace sheets, but do not emit these weak
+            // repeated candidates as duplicate/component PDFs.
+            if(sheets.Any(s=>s.Value!=null && s.Value.IsPaperSpace))
+            {
+                var weakModelDuplicates=sheets.Where(s=>s.Value!=null &&
+                    !s.Value.IsPaperSpace &&
+                    string.Equals(s.Value.Source,"RepeatedHostOuterFrame",StringComparison.OrdinalIgnoreCase)).ToList();
+                foreach(var duplicate in weakModelDuplicates)
+                {
+                    log.AppendLine("SKIP weak repeated ModelSpace candidate because PaperSpace sheets exist: "+
+                        path+" / C=("+duplicate.Value.Center.X.ToString("R",CultureInfo.InvariantCulture)+","+
+                        duplicate.Value.Center.Y.ToString("R",CultureInfo.InvariantCulture)+")");
+                    sheets.Remove(duplicate);
+                }
+            }
             var valid = new List<Tuple<string,Frame,string>>();
             var cleanedLayouts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < sheets.Count; i++)
@@ -477,12 +507,16 @@ namespace DwgBatchPdf
                 // successfully produced a page. Only a missing/zero-byte output is
                 // unquestionably invalid; visual/content validation belongs in a
                 // separate post-processing step and must never silently lose sheets.
-                // AutoCAD's truly blank one-page PDF is normally about 1.5 KiB.
-                // Do not count that output as a successfully exported sheet.
-                if (!info.Exists || info.Length < 2048)
+                // AutoCAD's blank output is not a fixed size. Depending on media
+                // and one surviving border fragment it is commonly 2.3--4.5 KiB,
+                // so a byte threshold alone accepts empty pages as successful.
+                // Reject only the conservative signature produced by such pages:
+                // a small PDF with no font/image resources and only tiny streams.
+                string blankReason="missing-file";
+                if (!info.Exists || IsLikelyBlankPlot(output,out blankReason))
                 {
                     if (info.Exists) info.Delete();
-                    log.AppendLine("SKIP EMPTY FRAME " + (i + 1) + " " + path);
+                    log.AppendLine("SKIP EMPTY FRAME " + (i + 1) + " " + path+" / "+blankReason);
                 }
                 else valid.Add(Tuple.Create(sheet.Key,sheet.Value,output));
             }
@@ -780,6 +814,23 @@ namespace DwgBatchPdf
         {
             List<Frame> namedFrames=DetectNamedFrameBlocks(space,tr,job);
             List<Frame> repeatedOuterFrames=DetectRepeatedOuterFrameFamily(space,tr,job);
+            // Repetition alone is not sheet evidence. LV switchboard drawings
+            // contain many repeated equipment cells and schematic modules whose
+            // outlines form convincing rectangular families. Require a title-bar
+            // signature for every repeated-family page before it can override a
+            // named locator. Named frame blocks keep their independent path below.
+            if(repeatedOuterFrames.Count>0)
+            {
+                var repeatedTextMarks=new List<TextMark>();
+                CollectTextMarks(space,tr,Matrix3d.Identity,0,repeatedTextMarks);
+                foreach(Frame repeated in repeatedOuterFrames.ToList())
+                {
+                    if(HasTitleSignature(repeated,repeatedTextMarks)) continue;
+                    repeated.IsValid=false;
+                    repeated.Decision="rejected-repeated-component-without-title-signature";
+                    repeatedOuterFrames.Remove(repeated);
+                }
+            }
             double repeatedMedianArea=repeatedOuterFrames.Count==0 ? 0 :
                 repeatedOuterFrames.OrderBy(f=>f.Area).ElementAt(repeatedOuterFrames.Count/2).Area;
             double namedMedianArea=namedFrames.Count==0 ? 0 :
@@ -1113,7 +1164,12 @@ namespace DwgBatchPdf
             double hostArea=Math.Max(1.0,hostWidth*hostHeight);
             double medianArea=family.OrderBy(f=>f.Area).ElementAt(family.Count/2).Area;
             double fraction=medianArea/hostArea;
-            bool plausible=fraction>=.0025;
+            // 0.25% allowed repeated equipment cells and table panels to become
+            // sheets. Even a densely packed set of real drawings occupies a
+            // materially larger fraction of the robust host extent. Keep this
+            // threshold conservative; named-block and closed-border paths still
+            // recover unusual isolated sheet sizes.
+            bool plausible=fraction>=.01;
             if(!plausible)
                 Trace("repeated outer rejected as small components: count="+family.Count+
                     " medianArea="+medianArea.ToString("R",CultureInfo.InvariantCulture)+
@@ -1163,7 +1219,11 @@ namespace DwgBatchPdf
             var repeatedGroups=groups.Where(g=>g.Count>=2).ToList();
             if(repeatedGroups.Count==0) return new List<Frame>();
             double largestFamilyArea=repeatedGroups.Max(g=>g[0].Area);
-            var selectedGroups=repeatedGroups.Where(g=>g[0].Area>=largestFamilyArea*.12)
+            // A 12% cutoff admitted repeated detail modules beside the real sheet
+            // family. Mixed A-series sheets still differ by roughly a factor of
+            // two, so 35% retains legitimate neighbouring sizes while excluding
+            // the small component families seen in LVSB drawings.
+            var selectedGroups=repeatedGroups.Where(g=>g[0].Area>=largestFamilyArea*.35)
                 .OrderByDescending(g=>g[0].Area).ToList();
             Trace("repeated outer groups="+string.Join(",",selectedGroups.Select(g=>
                 g.Count+"x"+g[0].Width.ToString("0.##",CultureInfo.InvariantCulture)+"x"+
@@ -2252,6 +2312,7 @@ namespace DwgBatchPdf
             List<string> fontDirs=FontSearchDirectories(db);
             using (Transaction tr = db.TransactionManager.StartTransaction())
             {
+                var unresolvedStyleIds=new HashSet<ObjectId>();
                 TextStyleTable styles = (TextStyleTable)tr.GetObject(db.TextStyleTableId, OpenMode.ForRead);
                 foreach (ObjectId id in styles)
                 {
@@ -2270,8 +2331,7 @@ namespace DwgBatchPdf
                     bool missingMain=hasTypeFace ? false : !FontExists(style.FileName,fontDirs);
                     bool missingBig=!string.IsNullOrWhiteSpace(style.BigFontFileName) &&
                         !FontExists(style.BigFontFileName,fontDirs);
-                    bool isShx=!string.IsNullOrWhiteSpace(style.FileName) &&
-                        style.FileName.EndsWith(".shx",StringComparison.OrdinalIgnoreCase);
+                    if(missingMain || missingBig) unresolvedStyleIds.Add(id);
                     log.AppendLine("FONT STYLE name="+style.Name+" typeface="+typeFace+" main="+(style.FileName??"")+" ["+
                         (missingMain?"MISSING":"FOUND")+"] big="+(style.BigFontFileName??"")+" ["+
                         (string.IsNullOrWhiteSpace(style.BigFontFileName)?"NONE":(missingBig?"MISSING":"FOUND"))+"]");
@@ -2279,7 +2339,16 @@ namespace DwgBatchPdf
                     style.UpgradeOpen();
                     if(missingMain)
                     {
-                        style.FileName=(isShx || style.IsShapeFile)?"txt.shx":"simsun.ttc";
+                        // Do not use txt.shx as a fallback for a missing text SHX.
+                        // It can draw Latin glyphs, but Chinese Unicode text is then
+                        // emitted as question marks. Shape-file styles describe
+                        // symbols rather than text and must remain SHX-backed.
+                        if(!style.IsShapeFile)
+                        {
+                            style.FileName="simsun.ttc";
+                            style.BigFontFileName=string.Empty;
+                            style.Font=new Autodesk.AutoCAD.GraphicsInterface.FontDescriptor("宋体",false,false,134,0);
+                        }
                         replacedMain++;
                     }
                     if(missingBig)
@@ -2290,6 +2359,7 @@ namespace DwgBatchPdf
                         // the original BigFont is unavailable.
                         style.FileName="simsun.ttc";
                         style.BigFontFileName=string.Empty;
+                        style.Font=new Autodesk.AutoCAD.GraphicsInterface.FontDescriptor("宋体",false,false,134,0);
                         replacedBig++;
                     }
                 }
@@ -2304,24 +2374,29 @@ namespace DwgBatchPdf
                             Entity entity=tr.GetObject(entityId,OpenMode.ForRead,false) as Entity;
                             if(entity==null) continue;
                             DBText text=entity as DBText;
-                            if(text!=null && Regex.IsMatch(text.TextString??"",@"\?{2,}")) literalQuestions++;
+                            if(text!=null && unresolvedStyleIds.Contains(text.TextStyleId))
+                                LogEncodedTextSample(log,"DBTEXT",text.TextString,ref literalQuestions);
+                            else if(text!=null && Regex.IsMatch(text.TextString??"",@"\?{2,}")) literalQuestions++;
                             MText mt=entity as MText;
-                            if(mt==null || string.IsNullOrEmpty(mt.Contents)) continue;
-                            if(Regex.IsMatch(mt.Text??"",@"\?{2,}")) literalQuestions++;
-                            string fixedContents=Regex.Replace(mt.Contents,@"\\([fF])([^;|]*)(\|[^;]*)?;",
-                                delegate(Match match)
+                            if(mt!=null)
+                            {
+                                if(unresolvedStyleIds.Contains(mt.TextStyleId))
+                                    LogEncodedTextSample(log,"MTEXT",mt.Text,ref literalQuestions);
+                                else if(Regex.IsMatch(mt.Text??"",@"\?{2,}")) literalQuestions++;
+                                string fixedContents=ReplaceMissingInlineFonts(mt.Contents,fontDirs,ref replacedInline);
+                                if(fixedContents!=mt.Contents)
                                 {
-                                    string inlineFont=match.Groups[2].Value.Trim();
-                                    if(string.IsNullOrWhiteSpace(Path.GetExtension(inlineFont)) || FontExists(inlineFont,fontDirs))
-                                        return match.Value;
-                                    replacedInline++;
-                                    return "\\"+match.Groups[1].Value+"SimSun"+match.Groups[3].Value+";";
-                                });
-                            if(fixedContents==mt.Contents) continue;
-                            LayerTableRecord layer=(LayerTableRecord)tr.GetObject(mt.LayerId,OpenMode.ForRead);
-                            if(layer.IsLocked) continue;
-                            mt.UpgradeOpen();
-                            mt.Contents=fixedContents;
+                                    LayerTableRecord layer=(LayerTableRecord)tr.GetObject(mt.LayerId,OpenMode.ForRead);
+                                    if(!layer.IsLocked)
+                                    {
+                                        mt.UpgradeOpen();
+                                        mt.Contents=fixedContents;
+                                    }
+                                }
+                            }
+                            BlockReference blockReference=entity as BlockReference;
+                            if(blockReference!=null)
+                                AuditBlockAttributes(blockReference,tr,unresolvedStyleIds,log,ref literalQuestions);
                         }
                         catch(Autodesk.AutoCAD.Runtime.Exception ex)
                         {
@@ -2335,6 +2410,51 @@ namespace DwgBatchPdf
                 " replaced-inline="+replacedInline+" literal-question-mark-entities="+literalQuestions);
             if(literalQuestions>0)
                 log.AppendLine("WARN UNRECOVERABLE_LITERAL_QUESTION_MARK: source text already contains ??; substitution cannot reconstruct it.");
+        }
+
+        private static string ReplaceMissingInlineFonts(string contents,List<string> fontDirs,ref int replacedInline)
+        {
+            if(string.IsNullOrEmpty(contents)) return contents;
+            int replacements=0;
+            string result=Regex.Replace(contents,@"\\([fF])([^;|]*)(\|[^;]*)?;",
+                delegate(Match match)
+                {
+                    string inlineFont=match.Groups[2].Value.Trim();
+                    // Family names (for example Arial or SimSun) do not have a
+                    // filename extension and are resolved by Windows. File-based
+                    // SHX/TTF overrides must exist or they are replaced by a
+                    // Unicode CJK family.
+                    if(string.IsNullOrWhiteSpace(Path.GetExtension(inlineFont)) || FontExists(inlineFont,fontDirs))
+                        return match.Value;
+                    replacements++;
+                    return "\\"+match.Groups[1].Value+"SimSun"+match.Groups[3].Value+";";
+                });
+            replacedInline+=replacements;
+            return result;
+        }
+
+        private static void AuditBlockAttributes(BlockReference blockReference,Transaction tr,
+            HashSet<ObjectId> unresolvedStyleIds,StringBuilder log,ref int literalQuestions)
+        {
+            foreach(ObjectId attributeId in blockReference.AttributeCollection)
+            {
+                AttributeReference attribute=tr.GetObject(attributeId,OpenMode.ForRead,false) as AttributeReference;
+                if(attribute==null) continue;
+                if(unresolvedStyleIds.Contains(attribute.TextStyleId))
+                    LogEncodedTextSample(log,"ATTRIBUTE["+(attribute.Tag??string.Empty)+"]",attribute.TextString,ref literalQuestions);
+                else if(Regex.IsMatch(attribute.TextString??string.Empty,@"\?{2,}"))
+                    literalQuestions++;
+            }
+        }
+
+        private static void LogEncodedTextSample(StringBuilder log,string kind,string value,ref int questionCounter)
+        {
+            if(string.IsNullOrEmpty(value)) return;
+            if(Regex.IsMatch(value,@"\?{2,}")) questionCounter++;
+            string shown=value.Replace("\r"," ").Replace("\n"," ");
+            if(shown.Length>80) shown=shown.Substring(0,80);
+            string codes=string.Join(",",value.Take(80).Select(c=>((int)c).ToString("X4",CultureInfo.InvariantCulture)));
+            log.AppendLine("FONT RAW "+kind+" text="+shown+" codepoints="+codes);
         }
 
         private static List<string> FontSearchDirectories(Database db)
@@ -2892,20 +3012,14 @@ namespace DwgBatchPdf
             {
                 if(frame.IsPaperSpace)
                 {
-                    try
-                    {
-                        PlotPaperSpaceDirect(db,layoutId,frame,output);
-                    }
-                    catch(Autodesk.AutoCAD.Runtime.Exception ex)
-                    {
-                        // AutoCAD 2018 rejects Window plotting on some layouts
-                        // with eInvalidInput even though the same frame geometry
-                        // is valid. Isolate exactly this sheet's paper entities
-                        // and viewports, then plot Extents from a clean layout.
-                        Trace("paper direct failed "+ex.ErrorStatus+"; isolated-layout fallback");
-                        try { if(File.Exists(output)) File.Delete(output); } catch { }
-                        PlotPaperSpaceWindow(db,layoutId,frame,output);
-                    }
+                    // Never plot a multi-sheet PaperSpace layout through Display.
+                    // In AutoCAD 2018 core console SetCurrentView is not a reliable
+                    // plot boundary: the plot engine can reuse the saved layout
+                    // display and fit every sheet onto one PDF page.  Physically
+                    // isolate this frame in a copied layout, then plot one explicit
+                    // local window.  A failed isolated plot is reported by the
+                    // caller; it must not fall back to whole-layout Display/Extents.
+                    PlotPaperSpaceWindow(db,layoutId,frame,output);
                 }
                 else
                 {
@@ -3007,11 +3121,12 @@ namespace DwgBatchPdf
 
         private static void PlotPaperSpaceWindow(Database db,ObjectId layoutId,Frame frame,string output)
         {
-            // Plotting a Window directly on a layout containing several model
-            // viewports is unreliable in AutoCAD 2018: the window and viewport
-            // clips are applied in different display coordinate systems.  Copy
-            // the entities belonging to this sheet to an isolated temporary
-            // layout and plot its extents instead.
+            // Plotting a Window directly on the original layout is unreliable in
+            // AutoCAD 2018 because several sheets/viewports remain visible. Copy
+            // the layout, remove everything assigned to neighbouring frames, move
+            // this sheet to a deterministic positive local window, and print only
+            // that window. This keeps the original viewport/model graphics while
+            // making it impossible for the plot area to include another sheet.
             string tempName="BATCHPDF_PS_"+Guid.NewGuid().ToString("N");
             LayoutManager manager=LayoutManager.Current;
             string previousLayout=manager.CurrentLayout;
@@ -3021,10 +3136,10 @@ namespace DwgBatchPdf
                 sourceLayoutName=((Layout)nameTr.GetObject(layoutId,OpenMode.ForRead)).LayoutName;
                 nameTr.Commit();
             }
-            // Copy the complete source layout so AutoCAD preserves viewport model
-            // links, non-rectangular clips, layer overrides and annotation state.
-            // Recreating a Viewport property-by-property produced valid but blank
-            // 3 KB PDFs in AutoCAD 2018.
+            // Preserve the source layout/viewport implementation for the rare
+            // drawings where direct PaperSpace Display remains unavailable.
+            // The normal path no longer reaches this fallback after the
+            // PaperSpace view Target/CenterPoint correction below.
             manager.CopyLayout(sourceLayoutName,tempName);
             ObjectId tempLayoutId;
             using(Transaction idTr=db.TransactionManager.StartOpenCloseTransaction())
@@ -3043,11 +3158,10 @@ namespace DwgBatchPdf
                 ActivatePaperLayout(db,tempName);
                 int copied=IsolateCopiedPaperSheet(db,tempLayoutId,frame);
                 if(copied==0) throw new InvalidOperationException("图框范围内没有可打印的PaperSpace实体。");
-                // Newly appended paper entities/viewports are not reflected in the
-                // layout extents cache in AutoCAD 2018 core console. Plotting
-                // Extents here produced a technically valid but empty ~8 KB PDF.
-                // The copied sheet is deliberately shifted so its outer frame starts
-                // at (0,0); use that deterministic local window instead.
+                // Extents inherited from CopyLayout still describe the original
+                // multi-sheet layout. They must never be used for this plot. The
+                // isolated sheet starts at a small positive pad and the explicit
+                // local window below is independent of AutoCAD's extents cache.
                 try { db.UpdateExt(true); } catch { }
                 try
                 {
@@ -3073,14 +3187,21 @@ namespace DwgBatchPdf
                     bool paperLandscape=ps.PlotPaperSize.X>=ps.PlotPaperSize.Y;
                     bool frameLandscape=frame.Width>=frame.Height;
                     v.SetPlotRotation(ps,paperLandscape==frameLandscape ? PlotRotation.Degrees000 : PlotRotation.Degrees090);
-                    // AutoCAD 2018 core console rejects PlotType.Window for these
-                    // PaperSpace layouts at SetPlotType itself. Extents is reliable
-                    // after CopyPaperSheetToLayout has moved the isolated sheet into
-                    // positive coordinates and the database/view have been refreshed.
-                    v.SetPlotType(ps,Autodesk.AutoCAD.DatabaseServices.PlotType.Extents);
+                    double localPad=Math.Max(frame.Width,frame.Height)*.005;
+                    Extents2d localWindow=new Extents2d(
+                        new Point2d(0,0),
+                        new Point2d(frame.Width+localPad*2,frame.Height+localPad*2));
+                    // SetPlotWindowArea before SetPlotType is the order required by
+                    // the AutoCAD 2018 validator. Unlike Display/Extents this is a
+                    // hard clipping boundary in the isolated layout coordinate
+                    // system, so crossing lines cannot expose a neighbouring sheet.
+                    v.SetPlotWindowArea(ps,localWindow);
+                    v.SetPlotType(ps,Autodesk.AutoCAD.DatabaseServices.PlotType.Window);
                     v.SetUseStandardScale(ps,true);v.SetStdScaleType(ps,StdScaleType.ScaleToFit);
                     v.SetPlotCentered(ps,true);
-                    Trace("paper copied-layout isolated="+copied+" frame="+frame.Width+"x"+frame.Height);
+                    Trace("paper isolated-window kept="+copied
+                        +" window=0,0,"+(frame.Width+localPad*2)+","+(frame.Height+localPad*2)
+                        +" frame="+frame.Width+"x"+frame.Height);
                     var info=new PlotInfo { Layout=tempLayoutId,OverrideSettings=ps };
                     new PlotInfoValidator { MediaMatchingPolicy=MatchingPolicy.MatchEnabled }.Validate(info);
                     using(PlotEngine pe=PlotFactory.CreatePublishEngine())
@@ -3121,21 +3242,45 @@ namespace DwgBatchPdf
             double minY=frame.Outline.Min(p=>p.Y),maxY=frame.Outline.Max(p=>p.Y);
             double pad=Math.Max(frame.Width,frame.Height)*.005;
             Vector3d shift=new Vector3d(-minX+pad,-minY+pad,0);
-            int kept=0;
+            int kept=0,keptViewports=0,frameLocators=0;
             using(Transaction tr=db.TransactionManager.StartTransaction())
             {
                 Layout layout=(Layout)tr.GetObject(layoutId,OpenMode.ForRead);
                 BlockTableRecord btr=(BlockTableRecord)tr.GetObject(layout.BlockTableRecordId,OpenMode.ForWrite);
                 var erase=new List<ObjectId>();
                 var move=new List<ObjectId>();
+                var viewportCandidates=new List<ObjectId>();
+                foreach(ObjectId id in btr)
+                {
+                    Viewport candidate=tr.GetObject(id,OpenMode.ForRead,false) as Viewport;
+                    if(candidate==null || candidate.Number<=1) continue;
+                    if(PaperEntityIntersectsFrame(candidate,minX,minY,maxX,maxY,pad))
+                        viewportCandidates.Add(id);
+                }
+                HashSet<ObjectId> selectedViewports=SelectPaperViewports(
+                    viewportCandidates,tr,minX,minY,maxX,maxY);
                 foreach(ObjectId id in btr)
                 {
                     Entity entity=tr.GetObject(id,OpenMode.ForRead,false) as Entity;
                     if(entity==null) continue;
                     Viewport viewport=entity as Viewport;
                     if(viewport!=null && viewport.Number<=1) continue;
-                    if(!PaperEntityBelongsToFrame(entity,minX,minY,maxX,maxY,pad)) erase.Add(id);
-                    else { move.Add(id); kept++; }
+                    // A layout can contain one global viewport plus local/detail
+                    // viewports for each sheet. Keeping every intersecting viewport
+                    // puts several model drawings on one PDF or lets an empty/global
+                    // viewport cover the correct one. Keep one scored main viewport
+                    // and only small, wholly-contained auxiliary viewports.
+                    bool belongs=viewport!=null
+                        ? selectedViewports.Contains(id)
+                        : PaperEntityBelongsToFrame(entity,minX,minY,maxX,maxY,pad);
+                    if(!belongs) erase.Add(id);
+                    else
+                    {
+                        move.Add(id);kept++;
+                        if(viewport!=null) keptViewports++;
+                        BlockReference block=entity as BlockReference;
+                        if(block!=null && LooksLikeFrameName(GetBlockName(block,tr))) frameLocators++;
+                    }
                 }
                 foreach(ObjectId id in erase)
                     ((Entity)tr.GetObject(id,OpenMode.ForWrite,false)).Erase();
@@ -3143,11 +3288,15 @@ namespace DwgBatchPdf
                 {
                     Entity entity=(Entity)tr.GetObject(id,OpenMode.ForWrite,false);
                     Viewport viewport=entity as Viewport;
-                    if(viewport!=null) viewport.CenterPoint=viewport.CenterPoint+shift;
+                    if(viewport!=null) CropAndShiftPaperViewport(viewport,minX,minY,maxX,maxY,shift,pad);
                     else entity.TransformBy(Matrix3d.Displacement(shift));
                 }
                 tr.Commit();
             }
+            Trace("paper isolation kept="+kept+" viewports="+keptViewports+
+                " top-level-frame-locators="+frameLocators);
+            if(frameLocators>1)
+                throw new InvalidOperationException("临时布局仍包含多个图框定位块，拒绝生成多图PDF。");
             // Reset paper extents to the isolated sheet. Extents inherited from the
             // copied multi-sheet layout would otherwise scale the selected sheet to
             // an invisible speck or produce an apparently blank page.
@@ -3160,84 +3309,112 @@ namespace DwgBatchPdf
             return kept;
         }
 
+        private static HashSet<ObjectId> SelectPaperViewports(List<ObjectId> candidates,
+            Transaction tr,double minX,double minY,double maxX,double maxY)
+        {
+            var selected=new HashSet<ObjectId>();
+            if(candidates==null || candidates.Count==0) return selected;
+            double frameArea=Math.Max(1.0,(maxX-minX)*(maxY-minY));
+            ObjectId mainId=ObjectId.Null;
+            double mainScore=double.MinValue,mainArea=0;
+            foreach(ObjectId id in candidates)
+            {
+                Viewport vp=tr.GetObject(id,OpenMode.ForRead,false) as Viewport;
+                if(vp==null) continue;
+                double left=vp.CenterPoint.X-vp.Width/2.0,right=vp.CenterPoint.X+vp.Width/2.0;
+                double bottom=vp.CenterPoint.Y-vp.Height/2.0,top=vp.CenterPoint.Y+vp.Height/2.0;
+                double iw=Math.Max(0,Math.Min(right,maxX)-Math.Max(left,minX));
+                double ih=Math.Max(0,Math.Min(top,maxY)-Math.Max(bottom,minY));
+                double intersection=iw*ih,vpArea=Math.Max(1.0,vp.Width*vp.Height);
+                double frameCoverage=intersection/frameArea;
+                double viewportContainment=intersection/vpArea;
+                bool centerInside=vp.CenterPoint.X>=minX && vp.CenterPoint.X<=maxX &&
+                    vp.CenterPoint.Y>=minY && vp.CenterPoint.Y<=maxY;
+                double areaRatio=vpArea/frameArea;
+                double score=frameCoverage*5.0+viewportContainment*3.0+
+                    (centerInside ? 2.0 : 0.0)-Math.Abs(Math.Log(Math.Max(.001,areaRatio)));
+                if(score>mainScore)
+                {
+                    mainScore=score;mainId=id;mainArea=vpArea;
+                }
+            }
+            if(mainId.IsNull) return selected;
+            selected.Add(mainId);
+            // Preserve genuine inset/detail viewports, but never a second viewport
+            // large enough to represent another complete sheet.
+            foreach(ObjectId id in candidates)
+            {
+                if(id==mainId) continue;
+                Viewport vp=tr.GetObject(id,OpenMode.ForRead,false) as Viewport;
+                if(vp==null) continue;
+                double left=vp.CenterPoint.X-vp.Width/2.0,right=vp.CenterPoint.X+vp.Width/2.0;
+                double bottom=vp.CenterPoint.Y-vp.Height/2.0,top=vp.CenterPoint.Y+vp.Height/2.0;
+                double iw=Math.Max(0,Math.Min(right,maxX)-Math.Max(left,minX));
+                double ih=Math.Max(0,Math.Min(top,maxY)-Math.Max(bottom,minY));
+                double vpArea=Math.Max(1.0,vp.Width*vp.Height);
+                bool whollyInside=(iw*ih)/vpArea>=.98;
+                if(whollyInside && vpArea<=mainArea*.20) selected.Add(id);
+            }
+            Trace("paper viewport selection candidates="+candidates.Count+
+                " selected="+selected.Count+" main-score="+
+                mainScore.ToString("0.###",CultureInfo.InvariantCulture));
+            return selected;
+        }
+
+        private static bool PaperEntityIntersectsFrame(Entity entity,double minX,double minY,
+            double maxX,double maxY,double tolerance)
+        {
+            try
+            {
+                Extents3d ext=entity.GeometricExtents;
+                return ext.MaxPoint.X>=minX-tolerance && ext.MinPoint.X<=maxX+tolerance &&
+                    ext.MaxPoint.Y>=minY-tolerance && ext.MinPoint.Y<=maxY+tolerance;
+            }
+            catch { return false; }
+        }
+
+        private static void CropAndShiftPaperViewport(Viewport viewport,double minX,double minY,
+            double maxX,double maxY,Vector3d shift,double tolerance)
+        {
+            double oldLeft=viewport.CenterPoint.X-viewport.Width/2.0;
+            double oldRight=viewport.CenterPoint.X+viewport.Width/2.0;
+            double oldBottom=viewport.CenterPoint.Y-viewport.Height/2.0;
+            double oldTop=viewport.CenterPoint.Y+viewport.Height/2.0;
+            double left=Math.Max(oldLeft,minX),right=Math.Min(oldRight,maxX);
+            double bottom=Math.Max(oldBottom,minY),top=Math.Min(oldTop,maxY);
+            if(right-left<=tolerance*.01 || top-bottom<=tolerance*.01)
+                throw new InvalidOperationException("视口与当前图框没有有效交集。");
+
+            Point3d oldCenter=viewport.CenterPoint;
+            double newCenterX=(left+right)/2.0,newCenterY=(bottom+top)/2.0;
+            double paperDx=newCenterX-oldCenter.X,paperDy=newCenterY-oldCenter.Y;
+            // Moving the paper viewport's centre must be accompanied by the same
+            // movement in its model view. Otherwise a shared viewport is cropped
+            // to the right paper rectangle but continues showing the old/adjacent
+            // drawing. ViewHeight/Height is the model-units-per-paper-unit scale.
+            double modelPerPaper=viewport.Height>1e-9 ? viewport.ViewHeight/viewport.Height : 1.0;
+            double c=Math.Cos(viewport.TwistAngle),s=Math.Sin(viewport.TwistAngle);
+            Vector2d modelDelta=new Vector2d(
+                (paperDx*c-paperDy*s)*modelPerPaper,
+                (paperDx*s+paperDy*c)*modelPerPaper);
+            viewport.ViewCenter=viewport.ViewCenter+modelDelta;
+            viewport.CenterPoint=new Point3d(newCenterX+shift.X,newCenterY+shift.Y,oldCenter.Z);
+            viewport.Width=right-left;
+            viewport.Height=top-bottom;
+            // A non-rectangular clip belongs to the original multi-sheet layout.
+            // Once the viewport is cropped to one rectangular sheet, retaining
+            // that remote clip can reveal an adjacent sheet or blank this one.
+            try { viewport.NonRectClipOn=false; } catch { }
+            viewport.On=true;
+            viewport.UpdateDisplay();
+        }
+
         private static void ActivatePaperLayout(Database db,string layoutName)
         {
             LayoutManager.Current.CurrentLayout=layoutName;
             db.TileMode=false;
             Editor editor=Application.DocumentManager.MdiActiveDocument.Editor;
             editor.SwitchToPaperSpace();
-            editor.Regen();
-        }
-
-        private static void PlotPaperSpaceDirect(Database db,ObjectId layoutId,Frame frame,string output)
-        {
-            string layoutName;
-            using(Transaction tr=db.TransactionManager.StartOpenCloseTransaction())
-            {
-                layoutName=((Layout)tr.GetObject(layoutId,OpenMode.ForRead)).LayoutName;
-                tr.Commit();
-            }
-            LayoutManager.Current.CurrentLayout=layoutName;
-            db.TileMode=false;
-            Editor ed=Application.DocumentManager.MdiActiveDocument.Editor;
-            try { ed.SwitchToPaperSpace(); } catch { }
-            EnsureFrameOutline(frame);
-            SetPaperFrameView(ed,frame);
-
-            using(var ps=new PlotSettings(false))
-            {
-                using(Transaction tr=db.TransactionManager.StartOpenCloseTransaction())
-                {
-                    ps.CopyFrom((Layout)tr.GetObject(layoutId,OpenMode.ForRead));tr.Commit();
-                }
-                PlotSettingsValidator v=PlotSettingsValidator.Current;
-                v.SetPlotConfigurationName(ps,"DWG To PDF.pc3",null);v.RefreshLists(ps);
-                v.SetCurrentStyleSheet(ps,"monochrome.ctb");
-                ps.ShadePlot=PlotSettingsShadePlotType.Wireframe;ps.PlotHidden=false;
-                ps.PlotPlotStyles=true;ps.ShowPlotStyles=true;ps.PrintLineweights=true;ps.PlotTransparency=true;
-                SelectMedia(ps,v,frame);
-                bool paperLandscape=ps.PlotPaperSize.X>=ps.PlotPaperSize.Y;
-                bool frameLandscape=frame.Width>=frame.Height;
-                v.SetPlotRotation(ps,paperLandscape==frameLandscape ? PlotRotation.Degrees000 : PlotRotation.Degrees090);
-                // PlotType.Window is rejected by AutoCAD 2018 core console for a
-                // number of legacy PaperSpace layouts. Display uses the active
-                // paper view framed above and, crucially, renders the ORIGINAL
-                // viewport instead of a lossy reconstructed copy.
-                v.SetPlotType(ps,Autodesk.AutoCAD.DatabaseServices.PlotType.Display);
-                v.SetUseStandardScale(ps,true);v.SetStdScaleType(ps,StdScaleType.ScaleToFit);v.SetPlotCentered(ps,true);
-                Trace("paper direct DISPLAY layout="+layoutName+" frame="+frame.Width+"x"+frame.Height);
-                var info=new PlotInfo { Layout=layoutId,OverrideSettings=ps };
-                new PlotInfoValidator { MediaMatchingPolicy=MatchingPolicy.MatchEnabled }.Validate(info);
-                using(PlotEngine pe=PlotFactory.CreatePublishEngine())
-                using(var dlg=new PlotProgressDialog(false,1,true))
-                {
-                    dlg.OnBeginPlot();pe.BeginPlot(dlg,null);
-                    pe.BeginDocument(info,Path.GetFileNameWithoutExtension(output),null,1,true,output);
-                    pe.BeginPage(new PlotPageInfo(),info,true,null);
-                    pe.BeginGenerateGraphics(null);pe.EndGenerateGraphics(null);
-                    pe.EndPage(null);pe.EndDocument(null);pe.EndPlot(null);dlg.OnEndPlot();
-                }
-            }
-        }
-
-        private static void SetPaperFrameView(Editor editor,Frame frame)
-        {
-            using(ViewTableRecord view=editor.GetCurrentView())
-            {
-                double wantedWidth=frame.Width*1.01;
-                double wantedHeight=frame.Height*1.01;
-                double displayAspect=view.Height>1e-9 ? view.Width/view.Height : wantedWidth/wantedHeight;
-                if(displayAspect>wantedWidth/wantedHeight) wantedWidth=wantedHeight*displayAspect;
-                else wantedHeight=wantedWidth/displayAspect;
-                view.PerspectiveEnabled=false;
-                view.ViewDirection=Vector3d.ZAxis;
-                view.Target=new Point3d(frame.Center.X,frame.Center.Y,0);
-                view.ViewTwist=-frame.Angle;
-                view.CenterPoint=Point2d.Origin;
-                view.Width=wantedWidth;
-                view.Height=wantedHeight;
-                editor.SetCurrentView(view);
-            }
             editor.Regen();
         }
 
@@ -3431,10 +3608,15 @@ namespace DwgBatchPdf
                     try
                     {
                         Extents3d ext=entity.GeometricExtents;
-                        double cx=(ext.MinPoint.X+ext.MaxPoint.X)/2.0;
-                        double cy=(ext.MinPoint.Y+ext.MaxPoint.Y)/2.0;
-                        belongs=cx>=minX-tolerance && cx<=maxX+tolerance &&
-                                cy>=minY-tolerance && cy<=maxY+tolerance;
+                        // Centre-point assignment removed complete drawing blocks
+                        // when their extents crossed the selected frame but their
+                        // centre happened to lie outside it. Keep every entity
+                        // whose extents intersect the frame; the active display
+                        // view performs the final clipping at the sheet boundary.
+                        belongs=ext.MaxPoint.X>=minX-tolerance &&
+                                ext.MinPoint.X<=maxX+tolerance &&
+                                ext.MaxPoint.Y>=minY-tolerance &&
+                                ext.MinPoint.Y<=maxY+tolerance;
                     }
                     catch { belongs=true; }
                     if(belongs) continue;
@@ -3445,6 +3627,144 @@ namespace DwgBatchPdf
                 tr.Commit();
             }
             return hidden;
+        }
+
+        private static bool IsLikelyBlankPlot(string path,out string reason)
+        {
+            reason=string.Empty;
+            try
+            {
+                var info=new FileInfo(path);
+                if(!info.Exists) { reason="missing-file";return true; }
+                if(info.Length<2048) { reason="below-2048-bytes";return true; }
+                // Never reject a substantial page or a page that advertises text,
+                // images or reusable drawing objects. This guard is deliberately
+                // narrower than a simple 5/8 KiB cutoff so sparse vector sheets
+                // remain valid.
+                if(info.Length>=8192) return false;
+                byte[] bytes=File.ReadAllBytes(path);
+                string ascii=Encoding.ASCII.GetString(bytes);
+                if(ascii.IndexOf("/Font",StringComparison.Ordinal)>=0 ||
+                   ascii.IndexOf("/Subtype /Image",StringComparison.Ordinal)>=0 ||
+                   ascii.IndexOf("/Type /XObject",StringComparison.Ordinal)>=0)
+                    return false;
+                MatchCollection lengths=Regex.Matches(ascii,@"/Length\s+(\d+)");
+                int maxStreamLength=0;
+                foreach(Match match in lengths)
+                {
+                    int value;
+                    if(int.TryParse(match.Groups[1].Value,NumberStyles.Integer,
+                        CultureInfo.InvariantCulture,out value))
+                        maxStreamLength=Math.Max(maxStreamLength,value);
+                }
+                if(maxStreamLength<=512)
+                {
+                    reason="no-font-or-image-and-max-stream="+maxStreamLength+
+                        ",bytes="+info.Length;
+                    return true;
+                }
+                string drawing=DecodePdfDrawingStreams(bytes);
+                if(!string.IsNullOrEmpty(drawing))
+                {
+                    // Disregard the initial full-page clipping polygon emitted by
+                    // AutoCAD; it is present even when no drawing geometry exists.
+                    int clipEnd=drawing.IndexOf("W n",StringComparison.Ordinal);
+                    if(clipEnd>=0) drawing=drawing.Substring(clipEnd+3);
+                    int paintOps=Regex.Matches(drawing,
+                        @"(?m)(?:^|\s)(?:S|s|f\*?|B\*?|b\*?)(?=\s|$)").Count;
+                    MatchCollection points=Regex.Matches(drawing,
+                        @"([-+]?\d+(?:\.\d+)?)\s+([-+]?\d+(?:\.\d+)?)\s+[ml](?=\s|$)");
+                    if(paintOps<=3)
+                    {
+                        reason="only-"+paintOps+"-paint-operations,bytes="+info.Length;
+                        return true;
+                    }
+                    if(points.Count>=2)
+                    {
+                        var xs=new List<double>();var ys=new List<double>();
+                        foreach(Match point in points)
+                        {
+                            double x,y;
+                            if(double.TryParse(point.Groups[1].Value,NumberStyles.Float,CultureInfo.InvariantCulture,out x) &&
+                               double.TryParse(point.Groups[2].Value,NumberStyles.Float,CultureInfo.InvariantCulture,out y))
+                            { xs.Add(x);ys.Add(y); }
+                        }
+                        // AutoCAD's plot coordinates are normally around
+                        // 10,000 units wide. A component clustered into less than
+                        // 5% of that span is not a complete sheet.
+                        if(xs.Count>=2 && (xs.Max()-xs.Min())<650 && (ys.Max()-ys.Min())<650)
+                        {
+                            reason="vector-content-cluster="+
+                                (xs.Max()-xs.Min()).ToString("0",CultureInfo.InvariantCulture)+"x"+
+                                (ys.Max()-ys.Min()).ToString("0",CultureInfo.InvariantCulture)+
+                                ",bytes="+info.Length;
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+            catch(System.Exception ex)
+            {
+                // Validation failure must not lose a successfully plotted sheet.
+                reason="validation-error:"+ex.Message;
+                return false;
+            }
+        }
+
+        private static string DecodePdfDrawingStreams(byte[] bytes)
+        {
+            var decoded=new StringBuilder();
+            byte[] start=Encoding.ASCII.GetBytes("stream");
+            byte[] end=Encoding.ASCII.GetBytes("endstream");
+            int position=0;
+            while(position<bytes.Length)
+            {
+                int streamAt=IndexOfBytes(bytes,start,position);
+                if(streamAt<0) break;
+                int dataAt=streamAt+start.Length;
+                if(dataAt<bytes.Length && bytes[dataAt]=='\r') dataAt++;
+                if(dataAt<bytes.Length && bytes[dataAt]=='\n') dataAt++;
+                int endAt=IndexOfBytes(bytes,end,dataAt);
+                if(endAt<0) break;
+                int dataEnd=endAt;
+                while(dataEnd>dataAt && (bytes[dataEnd-1]=='\r' || bytes[dataEnd-1]=='\n')) dataEnd--;
+                int length=dataEnd-dataAt;
+                if(length>0)
+                {
+                    try
+                    {
+                        // PDF Flate streams use a two-byte zlib header and a
+                        // four-byte checksum around the raw DEFLATE payload.
+                        int offset=dataAt+(length>6 ? 2 : 0);
+                        int count=length-(length>6 ? 6 : 0);
+                        using(var input=new MemoryStream(bytes,offset,count,false))
+                        using(var inflater=new DeflateStream(input,CompressionMode.Decompress))
+                        using(var output=new MemoryStream())
+                        {
+                            inflater.CopyTo(output);
+                            string value=Encoding.ASCII.GetString(output.ToArray());
+                            if(value.IndexOf(" m",StringComparison.Ordinal)>=0 ||
+                               value.IndexOf(" l",StringComparison.Ordinal)>=0)
+                                decoded.AppendLine(value);
+                        }
+                    }
+                    catch { }
+                }
+                position=endAt+end.Length;
+            }
+            return decoded.ToString();
+        }
+
+        private static int IndexOfBytes(byte[] source,byte[] pattern,int start)
+        {
+            for(int i=Math.Max(0,start);i<=source.Length-pattern.Length;i++)
+            {
+                int j=0;
+                for(;j<pattern.Length;j++) if(source[i+j]!=pattern[j]) break;
+                if(j==pattern.Length) return i;
+            }
+            return -1;
         }
 
         private static void RestoreModelEntityVisibility(Database db,List<ObjectId> hidden)
