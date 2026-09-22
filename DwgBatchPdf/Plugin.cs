@@ -52,6 +52,15 @@ namespace DwgBatchPdf
         public List<Point2d> Outline;
         public bool IsPaperSpace;
         public double ContourArea;
+        // Diagnostic profile calculated from the source space.  These values do
+        // not change the detected boundary; they let post-plot validation tell a
+        // real sparse sheet from an empty border/title template.
+        public int IntersectingEntityCount;
+        public int BodyEntityCount;
+        public int ViewportCount;
+        public int BlockReferenceCount;
+        public double BodyCoverage;
+        public bool ExpectsBodyContent;
         public double Area { get { return ContourArea > 0 ? ContourArea : Width * Height; } }
     }
 
@@ -383,8 +392,10 @@ namespace DwgBatchPdf
                                 WriteCandidateCsv(path, layout.LayoutName, detection.Candidates, job);
                                 if (isModel) WriteDebugDwg(path, detection.Candidates, job, log);
                             }
-                            AppendCandidateSummary(log, path, layout.LayoutName, detection.Candidates);
-                            log.AppendLine("FRAMES [" + frames.Count + "] " + path + " / " + layout.LayoutName);
+                             AppendCandidateSummary(log, path, layout.LayoutName, detection.Candidates);
+                            ProfileDetectedFrames(frames,btr,tr,log,path,layout.LayoutName,!isModel);
+                            frames=FilterClearlyEmptyPaperFrames(frames,log,path,layout.LayoutName);
+                             log.AppendLine("FRAMES [" + frames.Count + "] " + path + " / " + layout.LayoutName);
                             for (int fi = 0; fi < frames.Count; fi++)
                             {
                                 Frame f = frames[fi];
@@ -404,11 +415,13 @@ namespace DwgBatchPdf
                                     frames=BuildViewportFallbackFrames(btr,tr);
                                     log.AppendLine("FALLBACK paper viewports ["+frames.Count+"]: "+path+" / "+layout.LayoutName);
                                     if(frames.Count==0)
-                                    {
-                                        frames=BuildStrictPaperSingleLineFrames(detection,btr,tr,job);
-                                        log.AppendLine("FALLBACK paper single-line outer frames ["+frames.Count+"]: "+path+" / "+layout.LayoutName);
-                                    }
-                                    foreach(Frame frame in frames)
+                                     {
+                                         frames=BuildStrictPaperSingleLineFrames(detection,btr,tr,job);
+                                         log.AppendLine("FALLBACK paper single-line outer frames ["+frames.Count+"]: "+path+" / "+layout.LayoutName);
+                                     }
+                                    ProfileDetectedFrames(frames,btr,tr,log,path,layout.LayoutName,true);
+                                    frames=FilterClearlyEmptyPaperFrames(frames,log,path,layout.LayoutName);
+                                     foreach(Frame frame in frames)
                                     {
                                         frame.IsPaperSpace=true;
                                         sheets.Add(new KeyValuePair<string,Frame>(layout.LayoutName,frame));
@@ -458,7 +471,25 @@ namespace DwgBatchPdf
                         string output = AvailableOutputPath(OutputPath(path, job, sheet.Key, sameLayoutIndex, sameLayoutCount, sheet.Value));
                     if (job.Overwrite || !File.Exists(output)) Plot(doc.Database, layoutId, sheet.Value, output);
                     string blankReason;
-                    if(IsLikelyBlankPlot(output,out blankReason))
+                    bool blank=IsLikelyBlankPlot(output,sheet.Value,out blankReason);
+                    if(blank && !sheet.Value.IsPaperSpace && sheet.Value.ExpectsBodyContent)
+                    {
+                        log.AppendLine("TEMP VIEWPORT FIRST PLOT EMPTY; RETRY START "+path+" / "+sheet.Key+" / "+blankReason);
+                        try
+                        {
+                            if(File.Exists(output)) File.Delete(output);
+                            Plot(doc.Database,layoutId,sheet.Value,output);
+                            blank=IsLikelyBlankPlot(output,sheet.Value,out blankReason);
+                            log.AppendLine("TEMP VIEWPORT RETRY "+(blank?"EMPTY":"VALID")+" "+path+" / "+blankReason);
+                        }
+                        catch(System.Exception retryEx)
+                        {
+                            blank=true;blankReason="retry-error:"+retryEx.Message;
+                            log.AppendLine("TEMP VIEWPORT RETRY ERROR "+path+" / "+retryEx);
+                        }
+                    }
+                    log.AppendLine("PDF VALIDATION "+path+" / "+sheet.Key+" / "+blankReason);
+                    if(blank)
                     {
                         try { if(File.Exists(output)) File.Delete(output); } catch { }
                         log.AppendLine("SKIP EMPTY SIDE FRAME "+(i+1)+" "+path+" / "+blankReason);
@@ -533,8 +564,10 @@ namespace DwgBatchPdf
                         WriteCandidateCsv(path, layout.LayoutName, detection.Candidates, job);
                         WriteDebugDwg(path, detection.Candidates, job, log);
                     }
-                    AppendCandidateSummary(log, path, layout.LayoutName, detection.Candidates);
-                    Trace("after DetectFrames count=" + frames.Count);
+                     AppendCandidateSummary(log, path, layout.LayoutName, detection.Candidates);
+                    ProfileDetectedFrames(frames,btr,tr,log,path,layout.LayoutName,!layout.ModelType);
+                    frames=FilterClearlyEmptyPaperFrames(frames,log,path,layout.LayoutName);
+                     Trace("after DetectFrames count=" + frames.Count);
                     log.AppendLine("FRAMES [" + frames.Count + "] " + path + " / " + layout.LayoutName);
                     if(!layout.ModelType)
                     {
@@ -554,10 +587,12 @@ namespace DwgBatchPdf
                             log.AppendLine("FALLBACK paper viewports ["+frames.Count+"]: "+path+" / "+layout.LayoutName);
                             if(frames.Count==0)
                             {
-                                frames=BuildStrictPaperSingleLineFrames(detection,btr,tr,job);
-                                log.AppendLine("FALLBACK paper single-line outer frames ["+frames.Count+"]: "+path+" / "+layout.LayoutName);
-                            }
-                            foreach(Frame viewportFrame in frames)
+                                 frames=BuildStrictPaperSingleLineFrames(detection,btr,tr,job);
+                                 log.AppendLine("FALLBACK paper single-line outer frames ["+frames.Count+"]: "+path+" / "+layout.LayoutName);
+                             }
+                            ProfileDetectedFrames(frames,btr,tr,log,path,layout.LayoutName,true);
+                            frames=FilterClearlyEmptyPaperFrames(frames,log,path,layout.LayoutName);
+                             foreach(Frame viewportFrame in frames)
                             {
                                 viewportFrame.IsPaperSpace=true;
                                 sheets.Add(new KeyValuePair<string,Frame>(layout.LayoutName,viewportFrame));
@@ -653,7 +688,26 @@ namespace DwgBatchPdf
                 // Reject only the conservative signature produced by such pages:
                 // a small PDF with no font/image resources and only tiny streams.
                 string blankReason="missing-file";
-                if (!info.Exists || IsLikelyBlankPlot(output,out blankReason))
+                bool blank=!info.Exists || IsLikelyBlankPlot(output,sheet.Value,out blankReason);
+                if(blank && !sheet.Value.IsPaperSpace && sheet.Value.ExpectsBodyContent)
+                {
+                    log.AppendLine("TEMP VIEWPORT FIRST PLOT EMPTY; RETRY START FRAME "+(i+1)+" "+path+" / "+blankReason);
+                    try
+                    {
+                        if(File.Exists(output)) File.Delete(output);
+                        Plot(db,layoutId,sheet.Value,output);
+                        info=new FileInfo(output);
+                        blank=!info.Exists || IsLikelyBlankPlot(output,sheet.Value,out blankReason);
+                        log.AppendLine("TEMP VIEWPORT RETRY "+(blank?"EMPTY":"VALID")+" FRAME "+(i+1)+" "+path+" / "+blankReason);
+                    }
+                    catch(System.Exception retryEx)
+                    {
+                        blank=true;blankReason="retry-error:"+retryEx.Message;
+                        log.AppendLine("TEMP VIEWPORT RETRY ERROR FRAME "+(i+1)+" "+path+" / "+retryEx);
+                    }
+                }
+                log.AppendLine("PDF VALIDATION FRAME "+(i+1)+" "+path+" / "+blankReason);
+                if (blank)
                 {
                     if (info.Exists) info.Delete();
                     log.AppendLine("SKIP EMPTY FRAME " + (i + 1) + " " + path+" / "+blankReason);
@@ -951,6 +1005,317 @@ namespace DwgBatchPdf
                 return Math.Abs(dy) > rowTolerance ? Math.Sign(dy) : a.Center.X.CompareTo(b.Center.X);
             });
             return new DetectionResult { Frames=frames, Candidates=rectangles };
+        }
+
+        private static void ProfileDetectedFrames(IEnumerable<Frame> frames,BlockTableRecord space,
+            Transaction tr,StringBuilder log,string path,string layoutName,bool isPaperSpace)
+        {
+            if(frames==null) return;
+            foreach(Frame frame in frames)
+            {
+                frame.IsPaperSpace=isPaperSpace;
+                int intersecting=0,body=0,viewports=0,blocks=0;
+                bool hasBodyBounds=false;
+                double bodyMinX=0,bodyMinY=0,bodyMaxX=0,bodyMaxY=0;
+                foreach(ObjectId id in space)
+                {
+                    Entity entity=null;
+                    try { entity=tr.GetObject(id,OpenMode.ForRead,false) as Entity; }
+                    catch { continue; }
+                    if(entity==null || !entity.Visible) continue;
+                    Viewport viewport=entity as Viewport;
+                    if(viewport!=null && viewport.Number<=1) continue;
+                    double minX,minY,maxX,maxY;
+                    if(!TryGetEntityFrameLocalBounds(entity,frame,Matrix3d.Identity,
+                        out minX,out minY,out maxX,out maxY)) continue;
+                    double halfW=frame.Width/2.0,halfH=frame.Height/2.0;
+                    double ix0=Math.Max(-halfW,minX),iy0=Math.Max(-halfH,minY);
+                    double ix1=Math.Min(halfW,maxX),iy1=Math.Min(halfH,maxY);
+                    if(ix1<ix0 || iy1<iy0) continue;
+                    intersecting++;
+                    if(viewport!=null) viewports++;
+                    BlockReference block=entity as BlockReference;
+                    bool namedFrameBlock=false;
+                    if(block!=null)
+                    {
+                        blocks++;
+                        try { namedFrameBlock=LooksLikeFrameName(GetBlockName(block,tr)); } catch { }
+                    }
+                    double spanW=Math.Max(0,maxX-minX),spanH=Math.Max(0,maxY-minY);
+                    double localCenterX=(minX+maxX)/2.0,localCenterY=(minY+maxY)/2.0;
+                    bool edgeLine=entity is Curve &&
+                        ((spanW>=frame.Width*.70 && spanH<=frame.Height*.03 && Math.Abs(localCenterY)>=halfH*.82) ||
+                         (spanH>=frame.Height*.70 && spanW<=frame.Width*.03 && Math.Abs(localCenterX)>=halfW*.82));
+                    bool borderCurve=entity is Curve && spanW>=frame.Width*.78 && spanH>=frame.Height*.78 || edgeLine;
+                    bool inTitleZone=minX>=halfW*.42 || maxY<=-halfH*.55;
+                    bool titleOnly=inTitleZone &&
+                        (entity is DBText || entity is MText || entity is AttributeDefinition ||
+                         entity is Curve && (spanW<frame.Width*.45 || spanH<frame.Height*.45));
+                    bool bodyEntity=!borderCurve && !namedFrameBlock && !titleOnly;
+                    // A viewport or an ordinary block can carry a complete model
+                    // drawing even though it is represented by one PaperSpace
+                    // entity. Never discard it merely for having a small count.
+                    if(viewport!=null || block!=null && !namedFrameBlock) bodyEntity=true;
+                    if(block!=null && namedFrameBlock)
+                    {
+                        int nestedBody=0,nestedBlocks=0;
+                        double nestedMinX=0,nestedMinY=0,nestedMaxX=0,nestedMaxY=0;
+                        bool nestedBounds=false;
+                        ProfileNestedBlockContent(block,tr,frame,0,ref nestedBody,ref nestedBlocks,
+                            ref nestedBounds,ref nestedMinX,ref nestedMinY,ref nestedMaxX,ref nestedMaxY);
+                        blocks+=nestedBlocks;
+                        if(nestedBody>0)
+                        {
+                            body+=nestedBody;
+                            if(nestedBounds)
+                            {
+                                if(!hasBodyBounds)
+                                {
+                                    bodyMinX=nestedMinX;bodyMinY=nestedMinY;
+                                    bodyMaxX=nestedMaxX;bodyMaxY=nestedMaxY;hasBodyBounds=true;
+                                }
+                                else
+                                {
+                                    bodyMinX=Math.Min(bodyMinX,nestedMinX);bodyMinY=Math.Min(bodyMinY,nestedMinY);
+                                    bodyMaxX=Math.Max(bodyMaxX,nestedMaxX);bodyMaxY=Math.Max(bodyMaxY,nestedMaxY);
+                                }
+                            }
+                        }
+                    }
+                    if(!bodyEntity) continue;
+                    body++;
+                    if(!hasBodyBounds)
+                    {
+                        bodyMinX=ix0;bodyMinY=iy0;bodyMaxX=ix1;bodyMaxY=iy1;hasBodyBounds=true;
+                    }
+                    else
+                    {
+                        bodyMinX=Math.Min(bodyMinX,ix0);bodyMinY=Math.Min(bodyMinY,iy0);
+                        bodyMaxX=Math.Max(bodyMaxX,ix1);bodyMaxY=Math.Max(bodyMaxY,iy1);
+                    }
+                }
+                double coverage=hasBodyBounds && frame.Area>1e-9
+                    ? Math.Max(0,bodyMaxX-bodyMinX)*Math.Max(0,bodyMaxY-bodyMinY)/frame.Area : 0;
+                frame.IntersectingEntityCount=intersecting;
+                frame.BodyEntityCount=body;
+                frame.ViewportCount=viewports;
+                frame.BlockReferenceCount=blocks;
+                frame.BodyCoverage=Math.Min(1.0,Math.Max(0,coverage));
+                frame.ExpectsBodyContent=body>=2 || viewports>0 || blocks>0 && body>0;
+                log.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "FRAME PROFILE {0} / {1}: C=({2:R},{3:R}) entities={4} body={5} viewports={6} blocks={7} coverage={8:0.0000} expects-body={9}",
+                    path,layoutName,frame.Center.X,frame.Center.Y,intersecting,body,viewports,blocks,
+                    frame.BodyCoverage,frame.ExpectsBodyContent));
+            }
+        }
+
+        private static List<Frame> FilterClearlyEmptyPaperFrames(List<Frame> frames,StringBuilder log,
+            string path,string layoutName)
+        {
+            if(frames==null || frames.Count==0) return frames??new List<Frame>();
+            var kept=new List<Frame>();
+            foreach(Frame frame in frames)
+            {
+                bool namedLocator=frame.Source!=null &&
+                    frame.Source.StartsWith("NamedFrame",StringComparison.OrdinalIgnoreCase);
+                bool clearlyEmpty=frame.IsPaperSpace && namedLocator &&
+                    frame.ViewportCount==0 && frame.BodyEntityCount==0 && frame.BodyCoverage<=1e-9;
+                if(clearlyEmpty)
+                {
+                    frame.IsValid=false;
+                    frame.Decision="rejected-frame-without-body-content";
+                    log.AppendLine("SKIP FRAME_WITHOUT_BODY_CONTENT "+path+" / "+layoutName+
+                        " / C=("+frame.Center.X.ToString("R",CultureInfo.InvariantCulture)+","+
+                        frame.Center.Y.ToString("R",CultureInfo.InvariantCulture)+") source="+frame.Source);
+                    continue;
+                }
+                kept.Add(frame);
+            }
+            return kept;
+        }
+
+        private static void ProfileNestedBlockContent(BlockReference owner,Transaction tr,Frame frame,int depth,
+            ref int body,ref int blocks,ref bool hasBounds,ref double minBodyX,ref double minBodyY,
+            ref double maxBodyX,ref double maxBodyY)
+        {
+            if(owner==null || depth>6) return;
+            BlockTableRecord definition;
+            try { definition=(BlockTableRecord)tr.GetObject(owner.BlockTableRecord,OpenMode.ForRead); }
+            catch { return; }
+            if(definition.IsFromExternalReference)
+            {
+                body++;blocks++;
+                double x0,y0,x1,y1;
+                if(TryGetEntityFrameLocalBounds(owner,frame,Matrix3d.Identity,out x0,out y0,out x1,out y1))
+                    AddBodyBounds(x0,y0,x1,y1,ref hasBounds,ref minBodyX,ref minBodyY,ref maxBodyX,ref maxBodyY);
+                return;
+            }
+            Matrix3d transform=owner.BlockTransform;
+            foreach(ObjectId id in definition)
+            {
+                Entity entity;
+                try { entity=tr.GetObject(id,OpenMode.ForRead,false) as Entity; }
+                catch { continue; }
+                if(entity==null || !entity.Visible) continue;
+                double x0,y0,x1,y1;
+                if(!TryGetEntityFrameLocalBounds(entity,frame,transform,out x0,out y0,out x1,out y1)) continue;
+                double halfW=frame.Width/2.0,halfH=frame.Height/2.0;
+                double ix0=Math.Max(-halfW,x0),iy0=Math.Max(-halfH,y0);
+                double ix1=Math.Min(halfW,x1),iy1=Math.Min(halfH,y1);
+                if(ix1<ix0 || iy1<iy0) continue;
+                BlockReference child=entity as BlockReference;
+                bool childFrame=false;
+                if(child!=null)
+                {
+                    blocks++;
+                    try { childFrame=LooksLikeFrameName(GetBlockName(child,tr)); } catch { }
+                }
+                double spanW=Math.Max(0,x1-x0),spanH=Math.Max(0,y1-y0);
+                double centerX=(x0+x1)/2.0,centerY=(y0+y1)/2.0;
+                bool edgeLine=entity is Curve &&
+                    ((spanW>=frame.Width*.70 && spanH<=frame.Height*.03 && Math.Abs(centerY)>=halfH*.82) ||
+                     (spanH>=frame.Height*.70 && spanW<=frame.Width*.03 && Math.Abs(centerX)>=halfW*.82));
+                bool borderCurve=entity is Curve && spanW>=frame.Width*.78 && spanH>=frame.Height*.78 || edgeLine;
+                bool titleZone=x0>=halfW*.42 || y1<=-halfH*.55;
+                bool titleOnly=titleZone && (entity is DBText || entity is MText ||
+                    entity is AttributeDefinition || child!=null && spanW<frame.Width*.35 ||
+                    entity is Curve && (spanW<frame.Width*.45 || spanH<frame.Height*.45));
+                bool substantive=!borderCurve && !childFrame && !titleOnly;
+                if(child!=null)
+                {
+                    try
+                    {
+                        BlockTableRecord childDefinition=(BlockTableRecord)tr.GetObject(child.BlockTableRecord,OpenMode.ForRead);
+                        if(childDefinition.IsFromExternalReference) substantive=true;
+                    }
+                    catch { }
+                }
+                if(substantive)
+                {
+                    body++;
+                    AddBodyBounds(ix0,iy0,ix1,iy1,ref hasBounds,ref minBodyX,ref minBodyY,ref maxBodyX,ref maxBodyY);
+                }
+                if(child!=null && (childFrame || !substantive))
+                    ProfileNestedBlockContentTransformed(child,tr,frame,transform,depth+1,
+                        ref body,ref blocks,ref hasBounds,ref minBodyX,ref minBodyY,ref maxBodyX,ref maxBodyY);
+            }
+        }
+
+        private static void ProfileNestedBlockContentTransformed(BlockReference owner,Transaction tr,Frame frame,
+            Matrix3d parentTransform,int depth,ref int body,ref int blocks,ref bool hasBounds,
+            ref double minBodyX,ref double minBodyY,ref double maxBodyX,ref double maxBodyY)
+        {
+            if(owner==null || depth>6) return;
+            BlockTableRecord definition;
+            try { definition=(BlockTableRecord)tr.GetObject(owner.BlockTableRecord,OpenMode.ForRead); }
+            catch { return; }
+            Matrix3d transform=parentTransform*owner.BlockTransform;
+            if(definition.IsFromExternalReference)
+            {
+                body++;blocks++;
+                double x0,y0,x1,y1;
+                if(TryGetEntityFrameLocalBounds(owner,frame,parentTransform,out x0,out y0,out x1,out y1))
+                    AddBodyBounds(x0,y0,x1,y1,ref hasBounds,ref minBodyX,ref minBodyY,ref maxBodyX,ref maxBodyY);
+                return;
+            }
+            foreach(ObjectId id in definition)
+            {
+                Entity entity;
+                try { entity=tr.GetObject(id,OpenMode.ForRead,false) as Entity; }
+                catch { continue; }
+                if(entity==null || !entity.Visible) continue;
+                double x0,y0,x1,y1;
+                if(!TryGetEntityFrameLocalBounds(entity,frame,transform,out x0,out y0,out x1,out y1)) continue;
+                double halfW=frame.Width/2.0,halfH=frame.Height/2.0;
+                double ix0=Math.Max(-halfW,x0),iy0=Math.Max(-halfH,y0);
+                double ix1=Math.Min(halfW,x1),iy1=Math.Min(halfH,y1);
+                if(ix1<ix0 || iy1<iy0) continue;
+                BlockReference child=entity as BlockReference;
+                bool childFrame=false;
+                if(child!=null)
+                {
+                    blocks++;
+                    try { childFrame=LooksLikeFrameName(GetBlockName(child,tr)); } catch { }
+                }
+                double spanW=Math.Max(0,x1-x0),spanH=Math.Max(0,y1-y0);
+                double centerX=(x0+x1)/2.0,centerY=(y0+y1)/2.0;
+                bool edgeLine=entity is Curve &&
+                    ((spanW>=frame.Width*.70 && spanH<=frame.Height*.03 && Math.Abs(centerY)>=halfH*.82) ||
+                     (spanH>=frame.Height*.70 && spanW<=frame.Width*.03 && Math.Abs(centerX)>=halfW*.82));
+                bool borderCurve=entity is Curve && spanW>=frame.Width*.78 && spanH>=frame.Height*.78 || edgeLine;
+                bool titleZone=x0>=halfW*.42 || y1<=-halfH*.55;
+                bool titleOnly=titleZone && (entity is DBText || entity is MText ||
+                    entity is AttributeDefinition || child!=null && spanW<frame.Width*.35 ||
+                    entity is Curve && (spanW<frame.Width*.45 || spanH<frame.Height*.45));
+                bool substantive=!borderCurve && !childFrame && !titleOnly;
+                if(child!=null)
+                {
+                    try
+                    {
+                        BlockTableRecord childDefinition=(BlockTableRecord)tr.GetObject(child.BlockTableRecord,OpenMode.ForRead);
+                        if(childDefinition.IsFromExternalReference) substantive=true;
+                    }
+                    catch { }
+                }
+                if(substantive)
+                {
+                    body++;
+                    AddBodyBounds(ix0,iy0,ix1,iy1,ref hasBounds,ref minBodyX,ref minBodyY,ref maxBodyX,ref maxBodyY);
+                }
+                if(child!=null && (childFrame || !substantive))
+                    ProfileNestedBlockContentTransformed(child,tr,frame,transform,depth+1,
+                        ref body,ref blocks,ref hasBounds,ref minBodyX,ref minBodyY,ref maxBodyX,ref maxBodyY);
+            }
+        }
+
+        private static void AddBodyBounds(double x0,double y0,double x1,double y1,ref bool hasBounds,
+            ref double minBodyX,ref double minBodyY,ref double maxBodyX,ref double maxBodyY)
+        {
+            if(!hasBounds)
+            {
+                minBodyX=x0;minBodyY=y0;maxBodyX=x1;maxBodyY=y1;hasBounds=true;
+            }
+            else
+            {
+                minBodyX=Math.Min(minBodyX,x0);minBodyY=Math.Min(minBodyY,y0);
+                maxBodyX=Math.Max(maxBodyX,x1);maxBodyY=Math.Max(maxBodyY,y1);
+            }
+        }
+
+        private static bool TryGetEntityFrameLocalBounds(Entity entity,Frame frame,Matrix3d transform,
+            out double minX,out double minY,out double maxX,out double maxY)
+        {
+            minX=minY=maxX=maxY=0;
+            try
+            {
+                Extents3d ext;
+                Viewport viewport=entity as Viewport;
+                if(viewport!=null)
+                {
+                    double hx=viewport.Width/2.0,hy=viewport.Height/2.0;
+                    ext=new Extents3d(
+                        new Point3d(viewport.CenterPoint.X-hx,viewport.CenterPoint.Y-hy,0),
+                        new Point3d(viewport.CenterPoint.X+hx,viewport.CenterPoint.Y+hy,0));
+                }
+                else ext=entity.GeometricExtents;
+                Point3d[] corners={
+                    new Point3d(ext.MinPoint.X,ext.MinPoint.Y,0),
+                    new Point3d(ext.MinPoint.X,ext.MaxPoint.Y,0),
+                    new Point3d(ext.MaxPoint.X,ext.MinPoint.Y,0),
+                    new Point3d(ext.MaxPoint.X,ext.MaxPoint.Y,0)
+                };
+                double c=Math.Cos(frame.Angle),s=Math.Sin(frame.Angle);
+                for(int i=0;i<corners.Length;i++)
+                {
+                    Point3d transformed=corners[i].TransformBy(transform);
+                    double dx=transformed.X-frame.Center.X,dy=transformed.Y-frame.Center.Y;
+                    double x=dx*c+dy*s,y=-dx*s+dy*c;
+                    if(i==0) { minX=maxX=x;minY=maxY=y; }
+                    else { minX=Math.Min(minX,x);maxX=Math.Max(maxX,x);minY=Math.Min(minY,y);maxY=Math.Max(maxY,y); }
+                }
+                return true;
+            }
+            catch { return false; }
         }
 
         private static DetectionResult DetectBlockSheets(BlockTableRecord space, Transaction tr, Job job)
@@ -1595,44 +1960,56 @@ namespace DwgBatchPdf
             double repeatedMedian=accepted.Count==0 ? 0 :
                 accepted.OrderBy(f=>f.Area).ElementAt(accepted.Count/2).Area;
             var evaluated=new List<Frame>();
-            // Real sheets are among the largest host rectangles. In a very large
-            // model inspect only the largest closed candidates and never perform
-            // per-candidate scans over hundreds of thousands of LINE entities.
-            // The already proven repeated families remain untouched.
-            int candidateLimit=oversized ? 200 : 3000;
-            var candidatePool=rectangles.OrderByDescending(f=>f.Area).Take(candidateLimit).ToList();
+            // Apply every cheap deterministic rejection BEFORE imposing a
+            // candidate limit. The previous area-first Take(3000) admitted 2,986
+            // huge, very thin block extents and placed a genuine one-off A1 sheet
+            // at position 2,435. A 20-second wall-clock break then made detection
+            // depend on machine load. Geometry and mandatory title evidence reduce
+            // the pool without weakening the final sheet rules.
+            var geometryEligible=new List<Frame>();
+            foreach(Frame candidate in rectangles)
+            {
+                double shortSide=Math.Min(candidate.Width,candidate.Height);
+                double longSide=Math.Max(candidate.Width,candidate.Height);
+                double ratio=longSide/Math.Max(shortSide,1.0);
+                if(candidate.Width<job.MinFrameWidth || candidate.Height<job.MinFrameHeight)
+                { candidate.IsValid=false;candidate.Decision="rejected-singleton-below-minimum-size";continue; }
+                if(job.MinFrameArea>0 && candidate.Area<job.MinFrameArea)
+                { candidate.IsValid=false;candidate.Decision="rejected-singleton-below-minimum-area";continue; }
+                if(job.MaxFrameArea>0 && candidate.Area>job.MaxFrameArea)
+                { candidate.IsValid=false;candidate.Decision="rejected-singleton-above-maximum-area";continue; }
+                if(ratio<1.05 || ratio>8.0)
+                { candidate.IsValid=false;candidate.Decision="rejected-singleton-invalid-aspect";continue; }
+                if(repeatedMedian>0 && candidate.Area<repeatedMedian*.04)
+                { candidate.IsValid=false;candidate.Decision="rejected-singleton-component-scale";continue; }
+                geometryEligible.Add(candidate);
+            }
+            // Collapse only virtually identical geometry. Inner/outer border pairs
+            // remain separate because their overlap is below this strict value.
+            geometryEligible=geometryEligible.OrderByDescending(f=>f.Area)
+                .Aggregate(new List<Frame>(),(list,f)=>
+                { if(!list.Any(x=>FrameOverlap(x,f)>.995)) list.Add(f);return list; });
+            var titleEligible=geometryEligible.Where(f=>
+                    texts.Count(p=>PointInside(f,p))>=2 && HasTitleSignature(f,marks))
+                .ToList();
+            // Spatially independent candidates are the only possible additional
+            // sheets, so inspect them before duplicate borders around the proven
+            // repeated family. The bounded count is now applied after all cheap
+            // and mandatory filters, not to raw block extents.
+            int candidateLimit=oversized ? 500 : 3000;
+            var candidatePool=titleEligible
+                .OrderBy(f=>accepted.Any(a=>ContainsFrame(a,f) || ContainsFrame(f,a) ||
+                    FrameIntersectionOverSmaller(a,f)>.55) ? 1 : 0)
+                .ThenByDescending(f=>f.Area).Take(candidateLimit).ToList();
             int processed=0;
             foreach(Frame candidate in candidatePool)
             {
                 processed++;
-                if((DateTime.UtcNow-started).TotalSeconds>20.0)
-                {
-                    Trace("singleton different-size time budget reached; processed="+processed+
-                        "/"+candidatePool.Count+" accepted="+evaluated.Count);
-                    break;
-                }
                 if(processed%25==0)
                     Trace("singleton different-size progress="+processed+"/"+candidatePool.Count+
                         " accepted="+evaluated.Count);
                 candidate.IsValid=false;
                 candidate.Decision="singleton-different-size-candidate";
-                double shortSide=Math.Min(candidate.Width,candidate.Height);
-                double longSide=Math.Max(candidate.Width,candidate.Height);
-                double ratio=longSide/Math.Max(shortSide,1.0);
-                if(candidate.Width<job.MinFrameWidth || candidate.Height<job.MinFrameHeight)
-                { candidate.Decision="rejected-singleton-below-minimum-size";continue; }
-                if(job.MinFrameArea>0 && candidate.Area<job.MinFrameArea)
-                { candidate.Decision="rejected-singleton-below-minimum-area";continue; }
-                if(job.MaxFrameArea>0 && candidate.Area>job.MaxFrameArea)
-                { candidate.Decision="rejected-singleton-above-maximum-area";continue; }
-                if(ratio<1.05 || ratio>8.0)
-                { candidate.Decision="rejected-singleton-invalid-aspect";continue; }
-                // This relative floor is only a prefilter. A3 beside A0 remains
-                // eligible (roughly 12.5% area), while tiny title cells/equipment
-                // modules are discarded before expensive evidence checks.
-                if(repeatedMedian>0 && candidate.Area<repeatedMedian*.04)
-                { candidate.Decision="rejected-singleton-component-scale";continue; }
-
                 // Cheap spatial rejection must precede text/title/border scans.
                 // Most large candidates in dense schematics are duplicate inner
                 // or outer borders around an already accepted repeated sheet.
@@ -1648,11 +2025,6 @@ namespace DwgBatchPdf
                     ContainsFrame(candidate,f) || FrameIntersectionOverSmaller(f,candidate)>.55);
                 if(overlap)
                 { candidate.Decision="rejected-singleton-duplicate-existing-sheet";continue; }
-
-                if(texts.Count(p=>PointInside(candidate,p))<2)
-                { candidate.Decision="rejected-singleton-insufficient-text";continue; }
-                if(!HasTitleSignature(candidate,marks))
-                { candidate.Decision="rejected-singleton-no-title-signature";continue; }
 
                 bool hasBorderEvidence=candidate.StrongOuterEvidence ||
                     rectangles.Any(inner=>!object.ReferenceEquals(inner,candidate) &&
@@ -1679,7 +2051,9 @@ namespace DwgBatchPdf
             }
             diagnostics.AddRange(candidatePool.Where(f=>
                 f.IsValid || (f.Decision!=null && f.Decision.StartsWith("rejected-singleton",StringComparison.Ordinal))));
-            Trace("singleton different-size collected="+rectangles.Count+" pool="+candidatePool.Count+
+            Trace("singleton different-size collected="+rectangles.Count+
+                " geometryEligible="+geometryEligible.Count+" titleEligible="+titleEligible.Count+
+                " pool="+candidatePool.Count+
                 " processed="+processed+" oversized="+oversized+
                 " titledCandidates="+evaluated.Count+" accepted="+result.Count+
                 " elapsed="+(DateTime.UtcNow-started).TotalSeconds.ToString("0.0",CultureInfo.InvariantCulture)+"s");
@@ -2703,12 +3077,6 @@ namespace DwgBatchPdf
                    !frame.Source.StartsWith("NamedFrame",StringComparison.OrdinalIgnoreCase)) continue;
                 double widthScale=frame.Width/Math.Max(main.Width,1e-9);
                 double heightScale=frame.Height/Math.Max(main.Height,1e-9);
-                // Require an extreme mismatch in BOTH directions. A legitimate
-                // sheet can contain a relatively small viewport, but an A-series
-                // border inserted at 50/100/150 scale is orders of magnitude
-                // larger than every paper viewport in the same layout.
-                if(widthScale<8.0 || heightScale<8.0) continue;
-
                 Frame replacement=(detection.Candidates??new List<Frame>())
                     .Where(c=>c!=null && !object.ReferenceEquals(c,frame) && c.IsValid &&
                         PointInsideLoose(c,new Point2d(main.CenterPoint.X,main.CenterPoint.Y)) &&
@@ -2716,7 +3084,16 @@ namespace DwgBatchPdf
                         c.Width<=main.Width*4.0 && c.Height<=main.Height*4.0)
                     .OrderByDescending(c=>c.Area).FirstOrDefault();
 
-                if(replacement==null)
+                // A proven nested frame may correct a moderate scale mismatch.
+                // Synthesising a boundary from a viewport remains restricted to
+                // the old extreme threshold, because a legitimate large sheet can
+                // intentionally contain one small viewport plus extensive notes.
+                bool provenMismatch=replacement!=null &&
+                    ((widthScale>=2.5 && heightScale>=2.5) ||
+                     (Math.Max(widthScale,heightScale)>=5.0 && Math.Min(widthScale,heightScale)>=1.5));
+                bool extremeMismatch=widthScale>=8.0 && heightScale>=8.0;
+                if(!provenMismatch && !extremeMismatch) continue;
+                if(replacement==null && extremeMismatch)
                     replacement=BuildPaperFrameAroundViewport(space,tr,main,mainForFrame,i);
                 if(replacement==null) continue;
 
@@ -3849,7 +4226,18 @@ namespace DwgBatchPdf
                     // and avoids creating the crashing temporary viewport.
                     bool safeDirectDisplay=Math.Abs(frame.Angle)<1e-8 &&
                         frame.Width<=5000 && frame.Height<=5000;
-                    if(safeDirectDisplay) PlotModelFrameDirect(db,frame,output);
+                    if(Math.Abs(frame.Angle)>=1e-8)
+                    {
+                        // AutoCAD 2018 core console can terminate natively while
+                        // regenerating a twisted temporary viewport.  A native
+                        // access violation cannot be caught by the caller.  Keep
+                        // rotation as detection metadata, clone the entities that
+                        // intersect this sheet to an isolated model-space area,
+                        // rotate only those temporary copies to zero degrees, and
+                        // plot them through an ordinary untwisted viewport.
+                        PlotRotatedModelFrameFromIsolatedCopies(db,frame,output);
+                    }
+                    else if(safeDirectDisplay) PlotModelFrameDirect(db,frame,output);
                     else PlotFrameThroughPaperViewport(db, frame, output);
                 }
                 return;
@@ -4158,8 +4546,11 @@ namespace DwgBatchPdf
             }
             if(mainId.IsNull) return selected;
             selected.Add(mainId);
-            // Preserve genuine inset/detail viewports, but never a second viewport
-            // large enough to represent another complete sheet.
+            // Preserve every viewport wholly belonging to this paper frame. Many
+            // legacy sheets use two or more comparable viewports for complementary
+            // disciplines/layers; keeping only one "main" viewport produced a
+            // correct border with most model geometry missing. Neighbouring-sheet
+            // viewports are excluded by containment in the already isolated frame.
             foreach(ObjectId id in candidates)
             {
                 if(id==mainId) continue;
@@ -4171,7 +4562,9 @@ namespace DwgBatchPdf
                 double ih=Math.Max(0,Math.Min(top,maxY)-Math.Max(bottom,minY));
                 double vpArea=Math.Max(1.0,vp.Width*vp.Height);
                 bool whollyInside=(iw*ih)/vpArea>=.98;
-                if(whollyInside && vpArea<=mainArea*.20) selected.Add(id);
+                bool centerInside=vp.CenterPoint.X>=minX && vp.CenterPoint.X<=maxX &&
+                    vp.CenterPoint.Y>=minY && vp.CenterPoint.Y<=maxY;
+                if(whollyInside && centerInside) selected.Add(id);
             }
             Trace("paper viewport selection candidates="+candidates.Count+
                 " selected="+selected.Count+" main-score="+
@@ -4328,10 +4721,24 @@ namespace DwgBatchPdf
             {
                 Extents3d e=entity.GeometricExtents;
                 double cx=(e.MinPoint.X+e.MaxPoint.X)/2.0,cy=(e.MinPoint.Y+e.MaxPoint.Y)/2.0;
-                // Assignment by centre prevents a long line or neighbouring
-                // frame touching this frame from leaking into both PDFs.
-                return cx>=minX-tolerance && cx<=maxX+tolerance &&
-                       cy>=minY-tolerance && cy<=maxY+tolerance;
+                bool centerInside=cx>=minX-tolerance && cx<=maxX+tolerance &&
+                    cy>=minY-tolerance && cy<=maxY+tolerance;
+                if(centerInside) return true;
+                // Centre-only assignment drops long leaders, tables, XREFs and
+                // blocks whose useful geometry lies inside the sheet while their
+                // overall centre falls just outside. Keep entities with a material
+                // intersection; the explicit plot window still clips everything
+                // at this sheet's outer border, so adjacent sheets cannot leak in.
+                double iw=Math.Max(0,Math.Min(e.MaxPoint.X,maxX)-Math.Max(e.MinPoint.X,minX));
+                double ih=Math.Max(0,Math.Min(e.MaxPoint.Y,maxY)-Math.Max(e.MinPoint.Y,minY));
+                double ew=Math.Max(tolerance*.01,e.MaxPoint.X-e.MinPoint.X);
+                double eh=Math.Max(tolerance*.01,e.MaxPoint.Y-e.MinPoint.Y);
+                bool lineLike=(e.MaxPoint.X-e.MinPoint.X)<=tolerance*.01 ||
+                    (e.MaxPoint.Y-e.MinPoint.Y)<=tolerance*.01;
+                bool xOverlap=e.MaxPoint.X>=minX && e.MinPoint.X<=maxX;
+                bool yOverlap=e.MaxPoint.Y>=minY && e.MinPoint.Y<=maxY;
+                if(lineLike) return xOverlap && yOverlap;
+                return iw*ih/(ew*eh)>=.25;
             }
             catch { return false; }
         }
@@ -4449,23 +4856,32 @@ namespace DwgBatchPdf
 
         private static bool IsLikelyBlankPlot(string path,out string reason)
         {
+            return IsLikelyBlankPlot(path,null,out reason);
+        }
+
+        private static bool IsLikelyBlankPlot(string path,Frame expectedFrame,out string reason)
+        {
             reason=string.Empty;
             try
             {
                 var info=new FileInfo(path);
                 if(!info.Exists) { reason="missing-file";return true; }
                 if(info.Length<2048) { reason="below-2048-bytes";return true; }
-                // Never reject a substantial page or a page that advertises text,
-                // images or reusable drawing objects. This guard is deliberately
-                // narrower than a simple 5/8 KiB cutoff so sparse vector sheets
-                // remain valid.
-                if(info.Length>=8192) return false;
+                // File size and declared resources are not content validation. A
+                // border-only page with embedded fonts can be hundreds of KiB.
+                // Inspect AutoCAD's drawing streams for every reasonably-sized
+                // page; preserve very large/unparseable files rather than risking
+                // the loss of a legitimate raster or proxy-object sheet.
+                if(info.Length>32L*1024L*1024L)
+                {
+                    reason="valid-large-uninspected,bytes="+info.Length;
+                    return false;
+                }
                 byte[] bytes=File.ReadAllBytes(path);
                 string ascii=Encoding.ASCII.GetString(bytes);
-                if(ascii.IndexOf("/Font",StringComparison.Ordinal)>=0 ||
-                   ascii.IndexOf("/Subtype /Image",StringComparison.Ordinal)>=0 ||
-                   ascii.IndexOf("/Type /XObject",StringComparison.Ordinal)>=0)
-                    return false;
+                bool hasFont=ascii.IndexOf("/Font",StringComparison.Ordinal)>=0;
+                bool hasImage=ascii.IndexOf("/Subtype /Image",StringComparison.Ordinal)>=0;
+                bool hasXObject=ascii.IndexOf("/Type /XObject",StringComparison.Ordinal)>=0;
                 MatchCollection lengths=Regex.Matches(ascii,@"/Length\s+(\d+)");
                 int maxStreamLength=0;
                 foreach(Match match in lengths)
@@ -4475,7 +4891,7 @@ namespace DwgBatchPdf
                         CultureInfo.InvariantCulture,out value))
                         maxStreamLength=Math.Max(maxStreamLength,value);
                 }
-                if(maxStreamLength<=512)
+                if(maxStreamLength<=512 && !hasImage)
                 {
                     reason="no-font-or-image-and-max-stream="+maxStreamLength+
                         ",bytes="+info.Length;
@@ -4490,9 +4906,10 @@ namespace DwgBatchPdf
                     if(clipEnd>=0) drawing=drawing.Substring(clipEnd+3);
                     int paintOps=Regex.Matches(drawing,
                         @"(?m)(?:^|\s)(?:S|s|f\*?|B\*?|b\*?)(?=\s|$)").Count;
+                    int textOps=Regex.Matches(drawing,@"(?m)(?:^|\s)(?:Tj|TJ)(?=\s|$)").Count;
                     MatchCollection points=Regex.Matches(drawing,
                         @"([-+]?\d+(?:\.\d+)?)\s+([-+]?\d+(?:\.\d+)?)\s+[ml](?=\s|$)");
-                    if(paintOps<=3)
+                    if(paintOps<=3 && textOps==0 && !hasImage)
                     {
                         reason="only-"+paintOps+"-paint-operations,bytes="+info.Length;
                         return true;
@@ -4507,19 +4924,59 @@ namespace DwgBatchPdf
                                double.TryParse(point.Groups[2].Value,NumberStyles.Float,CultureInfo.InvariantCulture,out y))
                             { xs.Add(x);ys.Add(y); }
                         }
-                        // AutoCAD's plot coordinates are normally around
-                        // 10,000 units wide. A component clustered into less than
-                        // 5% of that span is not a complete sheet.
-                        if(xs.Count>=2 && (xs.Max()-xs.Min())<650 && (ys.Max()-ys.Min())<650)
+                        Match media=Regex.Match(ascii,@"/MediaBox\s*\[\s*([-+]?\d+(?:\.\d+)?)\s+([-+]?\d+(?:\.\d+)?)\s+([-+]?\d+(?:\.\d+)?)\s+([-+]?\d+(?:\.\d+)?)\s*\]");
+                        double mx0=0,my0=0,mx1=0,my1=0;
+                        bool mediaParsed=media.Success &&
+                            double.TryParse(media.Groups[1].Value,NumberStyles.Float,CultureInfo.InvariantCulture,out mx0) &&
+                            double.TryParse(media.Groups[2].Value,NumberStyles.Float,CultureInfo.InvariantCulture,out my0) &&
+                            double.TryParse(media.Groups[3].Value,NumberStyles.Float,CultureInfo.InvariantCulture,out mx1) &&
+                            double.TryParse(media.Groups[4].Value,NumberStyles.Float,CultureInfo.InvariantCulture,out my1);
+                        double spanX=xs.Max()-xs.Min(),spanY=ys.Max()-ys.Min();
+                        // Use a ratio to the actual PDF MediaBox. The former fixed
+                        // 650-unit cutoff rejected valid A4/A3 PDFs whose complete
+                        // page coordinates are naturally below 650 points.
+                        if(xs.Count>=2 && mediaParsed && Math.Abs(mx1-mx0)>1 && Math.Abs(my1-my0)>1 &&
+                           spanX<Math.Abs(mx1-mx0)*.05 && spanY<Math.Abs(my1-my0)*.05)
                         {
                             reason="vector-content-cluster="+
-                                (xs.Max()-xs.Min()).ToString("0",CultureInfo.InvariantCulture)+"x"+
-                                (ys.Max()-ys.Min()).ToString("0",CultureInfo.InvariantCulture)+
+                                spanX.ToString("0",CultureInfo.InvariantCulture)+"x"+
+                                spanY.ToString("0",CultureInfo.InvariantCulture)+
                                 ",bytes="+info.Length;
                             return true;
                         }
                     }
+                    // Reject only a conservative border/title-only signature. The
+                    // DWG profile must say that body content was expected, and the
+                    // PDF must contain too few drawing/text operations to represent
+                    // it. Sparse notes and raster sheets are deliberately retained.
+                    if(expectedFrame!=null && expectedFrame.ExpectsBodyContent &&
+                       !hasImage && paintOps<=6 && textOps<=3)
+                    {
+                        reason="expected-body-but-border-only,paint="+paintOps+
+                            ",text="+textOps+",body="+expectedFrame.BodyEntityCount+
+                            ",coverage="+expectedFrame.BodyCoverage.ToString("0.0000",CultureInfo.InvariantCulture)+
+                            ",bytes="+info.Length;
+                        return true;
+                    }
+                    bool namedPaperLocator=expectedFrame!=null && expectedFrame.IsPaperSpace &&
+                        expectedFrame.Source!=null && expectedFrame.Source.StartsWith("NamedFrame",StringComparison.OrdinalIgnoreCase);
+                    if(namedPaperLocator && expectedFrame.ViewportCount==0 &&
+                       expectedFrame.BodyEntityCount==0 && expectedFrame.BodyCoverage<=1e-9 &&
+                       !hasFont && !hasImage && !hasXObject && info.Length<32768)
+                    {
+                        reason="frame-without-body-vector-residue,paint="+paintOps+
+                            ",text="+textOps+",bytes="+info.Length;
+                        return true;
+                    }
+                    reason="valid-content,paint="+paintOps+",text="+textOps+
+                        ",font="+hasFont+",image="+hasImage+",xobject="+hasXObject+
+                        ",bytes="+info.Length;
+                    return false;
                 }
+                // An undecodable stream can contain raster/proxy/vector content.
+                // Keep it, but make the uncertainty explicit in the log.
+                reason="valid-unparsed-stream,font="+hasFont+",image="+hasImage+
+                    ",xobject="+hasXObject+",max-stream="+maxStreamLength+",bytes="+info.Length;
                 return false;
             }
             catch(System.Exception ex)
@@ -4563,7 +5020,10 @@ namespace DwgBatchPdf
                             inflater.CopyTo(output);
                             string value=Encoding.ASCII.GetString(output.ToArray());
                             if(value.IndexOf(" m",StringComparison.Ordinal)>=0 ||
-                               value.IndexOf(" l",StringComparison.Ordinal)>=0)
+                               value.IndexOf(" l",StringComparison.Ordinal)>=0 ||
+                               value.IndexOf("BT",StringComparison.Ordinal)>=0 ||
+                               value.IndexOf("Tj",StringComparison.Ordinal)>=0 ||
+                               value.IndexOf("TJ",StringComparison.Ordinal)>=0)
                                 decoded.AppendLine(value);
                         }
                     }
@@ -4646,15 +5106,24 @@ namespace DwgBatchPdf
                     v.SetPlotRotation(ps,paperLandscape==frameLandscape
                         ? PlotRotation.Degrees000 : PlotRotation.Degrees090);
                     Trace("paper viewport: media selected");
-                    ConfigurePaperViewport(db, layoutId, frame, ps);
+                    ObjectId temporaryViewportId=ConfigurePaperViewport(db, layoutId, frame, ps);
                     Trace("paper viewport: viewport configured");
                     try
                     {
                         Editor plotEditor=Application.DocumentManager.MdiActiveDocument.Editor;
                         plotEditor.SwitchToPaperSpace();
                         plotEditor.Regen();
+                        // Entering ModelSpace through the active paper viewport is
+                        // what forces AutoCAD 2018 core console to build its model
+                        // graphics cache. A PaperSpace-only REGEN can leave a newly
+                        // created viewport completely blank.
+                        plotEditor.SwitchToModelSpace();
+                        plotEditor.Regen();
+                        plotEditor.SwitchToPaperSpace();
+                        plotEditor.Regen();
                     }
-                    catch { }
+                    catch(System.Exception warmEx) { Trace("temporary viewport warm failed: "+warmEx.Message); }
+                    LockTemporaryViewport(db,temporaryViewportId);
                     var info = new PlotInfo { Layout = layoutId, OverrideSettings = ps };
                     new PlotInfoValidator { MediaMatchingPolicy = MatchingPolicy.MatchEnabled }.Validate(info);
                     using (PlotEngine pe = PlotFactory.CreatePublishEngine())
@@ -4677,7 +5146,146 @@ namespace DwgBatchPdf
             }
         }
 
-        private static void ConfigurePaperViewport(Database db, ObjectId layoutId, Frame frame, PlotSettings ps)
+        private static void PlotRotatedModelFrameFromIsolatedCopies(Database db,Frame sourceFrame,string output)
+        {
+            var temporaryIds=new List<ObjectId>();
+            Frame plotFrame=null;
+            try
+            {
+                plotFrame=CreateAxisAlignedFrameCopies(db,sourceFrame,temporaryIds);
+                if(temporaryIds.Count==0)
+                    throw new InvalidOperationException("旋转图框范围内没有可复制的可打印实体。");
+                Trace(string.Format(CultureInfo.InvariantCulture,
+                    "ROTATED FRAME ISOLATED source-angle={0:R} copies={1} source-center=({2:R},{3:R}) plot-center=({4:R},{5:R}) size={6:R}x{7:R}",
+                    sourceFrame.Angle,temporaryIds.Count,sourceFrame.Center.X,sourceFrame.Center.Y,
+                    plotFrame.Center.X,plotFrame.Center.Y,plotFrame.Width,plotFrame.Height));
+                try
+                {
+                    PlotFrameThroughPaperViewport(db,plotFrame,output);
+                    Trace("ROTATED FRAME NORMAL ATTEMPT OK");
+                }
+                catch(System.Exception normalEx)
+                {
+                    Trace("ROTATED FRAME NORMAL ATTEMPT FAILED: "+normalEx);
+                    try { if(File.Exists(output)) File.Delete(output); } catch { }
+                    // The safe retry still uses only the isolated, already
+                    // horizontal copies.  It does not twist a viewport and does
+                    // not expose geometry belonging to neighbouring sheets.
+                    PlotModelFrameDirect(db,plotFrame,output);
+                    Trace("ROTATED FRAME SAFE RETRY OK");
+                }
+            }
+            finally
+            {
+                EraseTemporaryEntities(db,temporaryIds);
+            }
+        }
+
+        private static Frame CreateAxisAlignedFrameCopies(Database db,Frame sourceFrame,List<ObjectId> temporaryIds)
+        {
+            var sourceIds=new ObjectIdCollection();
+            ObjectId modelId;
+            double halfW=sourceFrame.Width/2.0,halfH=sourceFrame.Height/2.0;
+            double tolerance=Math.Max(sourceFrame.Width,sourceFrame.Height)*.002;
+            Point3d extMax;
+            try { db.UpdateExt(true); } catch { }
+            try { extMax=db.Extmax; }
+            catch { extMax=new Point3d(sourceFrame.Center.X+sourceFrame.Width*2,
+                sourceFrame.Center.Y+sourceFrame.Height*2,0); }
+            if(!IsFinite(extMax.X) || !IsFinite(extMax.Y))
+                extMax=new Point3d(sourceFrame.Center.X+sourceFrame.Width*2,
+                    sourceFrame.Center.Y+sourceFrame.Height*2,0);
+
+            using(Transaction tr=db.TransactionManager.StartOpenCloseTransaction())
+            {
+                BlockTable table=(BlockTable)tr.GetObject(db.BlockTableId,OpenMode.ForRead);
+                modelId=table[BlockTableRecord.ModelSpace];
+                BlockTableRecord model=(BlockTableRecord)tr.GetObject(modelId,OpenMode.ForRead);
+                foreach(ObjectId id in model)
+                {
+                    Entity entity=null;
+                    try { entity=tr.GetObject(id,OpenMode.ForRead,false) as Entity; }
+                    catch { continue; }
+                    if(entity==null || !entity.Visible) continue;
+                    try
+                    {
+                        LayerTableRecord layer=(LayerTableRecord)tr.GetObject(entity.LayerId,OpenMode.ForRead);
+                        if(layer.IsOff || layer.IsFrozen || !layer.IsPlottable) continue;
+                    }
+                    catch { continue; }
+                    double minX,minY,maxX,maxY;
+                    if(!TryGetEntityFrameLocalBounds(entity,sourceFrame,Matrix3d.Identity,
+                        out minX,out minY,out maxX,out maxY)) continue;
+                    if(maxX < -halfW-tolerance || minX > halfW+tolerance ||
+                       maxY < -halfH-tolerance || minY > halfH+tolerance) continue;
+                    sourceIds.Add(id);
+                }
+                tr.Commit();
+            }
+            if(sourceIds.Count==0) return new Frame { Center=sourceFrame.Center,
+                Width=sourceFrame.Width,Height=sourceFrame.Height,Angle=0 };
+
+            var mapping=new IdMapping();
+            db.DeepCloneObjects(sourceIds,modelId,mapping,false);
+            Point2d isolatedCenter=new Point2d(
+                extMax.X+sourceFrame.Width*4.0+1000.0,
+                extMax.Y+sourceFrame.Height*4.0+1000.0);
+            Matrix3d straighten=Matrix3d.Rotation(-sourceFrame.Angle,Vector3d.ZAxis,
+                new Point3d(sourceFrame.Center.X,sourceFrame.Center.Y,0));
+            Vector3d shift=new Vector3d(isolatedCenter.X-sourceFrame.Center.X,
+                isolatedCenter.Y-sourceFrame.Center.Y,0);
+            using(Transaction tr=db.TransactionManager.StartTransaction())
+            {
+                foreach(ObjectId sourceId in sourceIds)
+                {
+                    IdPair pair=mapping[sourceId];
+                    if(!pair.IsCloned || pair.Value.IsNull || !pair.Value.IsValid) continue;
+                    Entity clone=tr.GetObject(pair.Value,OpenMode.ForWrite,false) as Entity;
+                    if(clone==null) continue;
+                    clone.TransformBy(straighten);
+                    clone.TransformBy(Matrix3d.Displacement(shift));
+                    temporaryIds.Add(pair.Value);
+                }
+                tr.Commit();
+            }
+            return new Frame {
+                Center=isolatedCenter,Width=sourceFrame.Width,Height=sourceFrame.Height,Angle=0,
+                Source=sourceFrame.Source+":AxisAlignedPlotCopy",SourceDepth=sourceFrame.SourceDepth,
+                IsValid=true,StrongOuterEvidence=sourceFrame.StrongOuterEvidence,
+                DrawingNumber=sourceFrame.DrawingNumber,IsPaperSpace=false,
+                IntersectingEntityCount=sourceFrame.IntersectingEntityCount,
+                BodyEntityCount=sourceFrame.BodyEntityCount,ViewportCount=sourceFrame.ViewportCount,
+                BlockReferenceCount=sourceFrame.BlockReferenceCount,BodyCoverage=sourceFrame.BodyCoverage,
+                ExpectsBodyContent=sourceFrame.ExpectsBodyContent
+            };
+        }
+
+        private static bool IsFinite(double value)
+        {
+            return !Double.IsNaN(value) && !Double.IsInfinity(value) && Math.Abs(value)<1e100;
+        }
+
+        private static void EraseTemporaryEntities(Database db,List<ObjectId> ids)
+        {
+            if(ids==null || ids.Count==0) return;
+            try
+            {
+                using(Transaction tr=db.TransactionManager.StartTransaction())
+                {
+                    foreach(ObjectId id in ids)
+                    {
+                        if(id.IsNull || !id.IsValid || id.IsErased) continue;
+                        DBObject value=tr.GetObject(id,OpenMode.ForWrite,false);
+                        if(value!=null) value.Erase();
+                    }
+                    tr.Commit();
+                }
+                Trace("ROTATED FRAME temporary copies erased="+ids.Count);
+            }
+            catch(System.Exception ex) { Trace("ROTATED FRAME temporary cleanup failed: "+ex.Message); }
+        }
+
+        private static ObjectId ConfigurePaperViewport(Database db, ObjectId layoutId, Frame frame, PlotSettings ps)
         {
             Extents2d margins = ps.PlotPaperMargins;
             double minX = margins.MinPoint.X, minY = margins.MinPoint.Y;
@@ -4704,6 +5312,7 @@ namespace DwgBatchPdf
             double centerY = (printable.MinPoint.Y + printable.MaxPoint.Y) / 2.0;
             using (Transaction tr = db.TransactionManager.StartTransaction())
             {
+                ObjectId viewportLayerId=EnsureTemporaryViewportLayer(db,tr);
                 Layout layout = (Layout)tr.GetObject(layoutId, OpenMode.ForRead);
                 BlockTableRecord paper = (BlockTableRecord)tr.GetObject(layout.BlockTableRecordId, OpenMode.ForWrite);
                 var oldViewportIds = new List<ObjectId>();
@@ -4720,15 +5329,19 @@ namespace DwgBatchPdf
                     oldViewport.Erase();
                 }
                 var viewport = new Viewport();
+                viewport.SetDatabaseDefaults(db);
+                viewport.LayerId=viewportLayerId;
                 paper.AppendEntity(viewport);
                 tr.AddNewlyCreatedDBObject(viewport, true);
-                viewport.SetDatabaseDefaults();
                 viewport.CenterPoint = new Point3d(centerX, centerY, 0);
                 viewport.Width = viewportWidth;
                 viewport.Height = viewportHeight;
                 viewport.ViewDirection = Vector3d.ZAxis;
                 viewport.ShadePlot = ShadePlotType.Wireframe;
                 viewport.HiddenLinesRemoved = false;
+                viewport.PerspectiveOn=false;
+                viewport.FrontClipOn=false;
+                viewport.BackClipOn=false;
                 viewport.ViewTarget = new Point3d(frame.Center.X, frame.Center.Y, 0);
                 viewport.ViewCenter = Point2d.Origin;
                 // Keep the complete outer border inside the viewport. Cropping at
@@ -4739,12 +5352,11 @@ namespace DwgBatchPdf
                 // touching sheet. The tiny tolerance is only for numerical
                 // precision/half-lineweight at the border.
                 viewport.ViewHeight = frame.Height * 1.003;
-                // The frame angle is its rotation in WCS. A viewport must twist
-                // in the opposite direction to make that frame horizontal on
-                // paper. Using the same sign doubled the rotation (about 95
-                // degrees in the reported DWG), so the rectangular viewport
-                // showed only the diagonal portion crossing it.
-                viewport.TwistAngle = -frame.Angle;
+                // Rotation is resolved before this method by straightening
+                // temporary entity copies.  Never twist a generated viewport:
+                // AutoCAD 2018 core console can terminate during regeneration of
+                // a complex twisted viewport instead of throwing an exception.
+                viewport.TwistAngle = 0;
                 viewport.On = true;
                 // A newly-created viewport inherits every layer's
                 // IsFrozenInNewViewports flag. Those layers can be visible in the
@@ -4752,14 +5364,65 @@ namespace DwgBatchPdf
                 // Thaw only this temporary viewport; global Off/Frozen states in
                 // the original DWG remain untouched.
                 viewport.ThawAllLayersInViewport();
-                viewport.Locked = true;
+                // Lock only after the viewport has been activated and regenerated.
+                viewport.Locked = false;
+                viewport.UpdateDisplay();
                 // All accepted sheets are verified rectangles. The viewport is
                 // already the exact rectangular clipping boundary, so applying a
                 // second NonRectClip is both unnecessary and dangerous: a stale
                 // locator-block outline previously cut the sheet into a small,
                 // tilted fragment. Irregular contours are not accepted upstream.
+                ObjectId result=viewport.ObjectId;
                 tr.Commit();
+                return result;
             }
+        }
+
+        private static ObjectId EnsureTemporaryViewportLayer(Database db,Transaction tr)
+        {
+            const string name="BATCHPDF_VIEWPORT";
+            LayerTable layers=(LayerTable)tr.GetObject(db.LayerTableId,OpenMode.ForRead);
+            LayerTableRecord layer;
+            if(layers.Has(name)) layer=(LayerTableRecord)tr.GetObject(layers[name],OpenMode.ForWrite);
+            else
+            {
+                layers.UpgradeOpen();
+                layer=new LayerTableRecord { Name=name };
+                ObjectId id=layers.Add(layer);
+                tr.AddNewlyCreatedDBObject(layer,true);
+                layer.IsOff=false;layer.IsFrozen=false;layer.IsPlottable=true;
+                Trace("temporary viewport layer created id="+id.Handle);
+                return id;
+            }
+            layer.IsOff=false;
+            layer.IsFrozen=false;
+            layer.IsPlottable=true;
+            return layer.ObjectId;
+        }
+
+        private static void LockTemporaryViewport(Database db,ObjectId viewportId)
+        {
+            if(viewportId.IsNull || !viewportId.IsValid || viewportId.IsErased) return;
+            try
+            {
+                using(Transaction tr=db.TransactionManager.StartTransaction())
+                {
+                    Viewport viewport=tr.GetObject(viewportId,OpenMode.ForWrite,false) as Viewport;
+                    if(viewport!=null)
+                    {
+                        viewport.On=true;
+                        viewport.UpdateDisplay();
+                        viewport.Locked=true;
+                        LayerTableRecord layer=(LayerTableRecord)tr.GetObject(viewport.LayerId,OpenMode.ForRead);
+                        Trace("TEMP VIEWPORT layer="+layer.Name+" off="+layer.IsOff+
+                            " frozen="+layer.IsFrozen+" plottable="+layer.IsPlottable+
+                            " on="+viewport.On+" width="+viewport.Width+" height="+viewport.Height+
+                            " viewHeight="+viewport.ViewHeight+" target="+viewport.ViewTarget);
+                    }
+                    tr.Commit();
+                }
+            }
+            catch(System.Exception ex) { Trace("temporary viewport lock/verify failed: "+ex.Message); }
         }
 
         private static Extents2d GetOuterBorderWindow(Database db, Frame frame)
@@ -4809,9 +5472,9 @@ namespace DwgBatchPdf
                 view.PerspectiveEnabled = false;
                 view.ViewDirection = Vector3d.ZAxis;
                 view.Target = new Point3d(frame.Center.X, frame.Center.Y, 0);
-                // Rotate the WCS rectangle back to horizontal in the display.
-                // The view twist must cancel, not repeat, the frame angle.
-                view.ViewTwist = -frame.Angle;
+                // Rotated frames are plotted from isolated horizontal copies.
+                // Keep the active model display untwisted for core-console safety.
+                view.ViewTwist = 0;
                 view.CenterPoint = Point2d.Origin;
                 view.Width = wantedWidth;
                 view.Height = wantedHeight;
@@ -4846,7 +5509,7 @@ namespace DwgBatchPdf
                 // touching sheet.
                 view.Width = frame.Width * 1.0005;
                 view.Height = frame.Height * 1.0005;
-                view.ViewTwist = -frame.Angle;
+                view.ViewTwist = 0;
                 tr.Commit();
             }
             return name;

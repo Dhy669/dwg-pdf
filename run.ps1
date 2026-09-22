@@ -71,24 +71,13 @@ Get-CimInstance Win32_Process -Filter "Name='accoreconsole.exe'" -ErrorAction Si
   }
 
 $bin = Join-Path $PSScriptRoot 'DwgBatchPdf\bin\Release'
-$pluginDll = Join-Path $bin 'DwgBatchPdf.dll'
-$sourceFiles = @(
-  (Join-Path $PSScriptRoot 'DwgBatchPdf\Plugin.cs'),
-  (Join-Path $PSScriptRoot 'DwgBatchPdf\DwgBatchPdf.csproj')
-)
-$mustBuild = -not $SkipBuild -or -not (Test-Path -LiteralPath $pluginDll)
-if (-not $mustBuild) {
-  $dllTime = (Get-Item -LiteralPath $pluginDll).LastWriteTimeUtc
-  $mustBuild = [bool]($sourceFiles | Where-Object {
-    (Test-Path -LiteralPath $_) -and (Get-Item -LiteralPath $_).LastWriteTimeUtc -gt $dllTime
-  } | Select-Object -First 1)
-  if ($mustBuild) {
-    Write-Warning 'SkipBuild was ignored because the source code is newer than DwgBatchPdf.dll.'
-  }
-}
-if ($mustBuild) { & (Join-Path $PSScriptRoot 'build.ps1') -AcadDir $AcadDir }
+$frozenPluginDir = Join-Path $PSScriptRoot 'DwgBatchPdf\frozen-20260922-1408'
+$pluginDll = Join-Path $frozenPluginDir 'DwgBatchPdf.dll'
+# This workspace is intentionally pinned to the exact converter binary that was
+# used successfully at 14:08 on 2026-09-22.  Do not rebuild implicitly: later
+# source experiments must never replace the requested production version.
 if (-not (Test-Path -LiteralPath $pluginDll)) {
-  throw "Plugin DLL was not built: $pluginDll"
+  throw "Frozen 14:08 plugin DLL is missing: $pluginDll"
 }
 
 # AutoCAD 2018 NETLOAD is unreliable with non-ASCII paths. Stage runtime in TEMP.
@@ -96,7 +85,7 @@ $runtimeName = 'DwgBatchPdfRuntime_' + [Guid]::NewGuid().ToString('N')
 $runtime = Join-Path $env:TEMP $runtimeName
 New-Item -ItemType Directory -Force -Path $runtime | Out-Null
 Copy-Item $pluginDll (Join-Path $runtime 'DwgBatchPdf.dll') -Force
-Copy-Item (Join-Path $bin 'DwgBatchPdf.pdb') (Join-Path $runtime 'DwgBatchPdf.pdb') -Force
+Copy-Item (Join-Path $frozenPluginDir 'DwgBatchPdf.pdb') (Join-Path $runtime 'DwgBatchPdf.pdb') -Force
 $runtimeFonts = Join-Path $runtime 'Fonts'
 New-Item -ItemType Directory -Force -Path $runtimeFonts | Out-Null
 # Legacy SHX/BigFont text is decoded while AutoCAD opens the DWG, before the
