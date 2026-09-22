@@ -79,6 +79,7 @@ namespace DwgBatchPdf
         private static readonly HashSet<string> LockedOutputPaths=
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private static bool RepeatedFamilyRejectedAsSmallComponents;
+        private static string CurrentBatchLogPath;
         [CommandMethod("BATCHDWGTOPDF")]
         public void BatchDwgToPdf()
         {
@@ -87,6 +88,7 @@ namespace DwgBatchPdf
             string baseDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
             string jobPath = Path.Combine(baseDir, "batchjob.json");
             string logPath = Path.Combine(baseDir, "batch.log");
+            CurrentBatchLogPath=logPath;
             var log = new StringBuilder();
             int ok = 0, failed = 0;
             try
@@ -108,6 +110,8 @@ namespace DwgBatchPdf
                     : Directory.GetFiles(job.InputRoot, filter, option);
                 Trace("files=" + files.Length);
                 log.AppendLine("Started: " + DateTime.Now.ToString("s"));
+                log.AppendLine("PLUGIN BUILD: " + File.GetLastWriteTime(Assembly.GetExecutingAssembly().Location).ToString("s")+
+                    " SIZE="+new FileInfo(Assembly.GetExecutingAssembly().Location).Length);
                 log.AppendLine("DWG count: " + files.Length);
                 foreach (string dwg in files)
                 {
@@ -155,13 +159,115 @@ namespace DwgBatchPdf
         private static int ProcessDwg(string path, Job job, StringBuilder log)
         {
             Trace("ProcessDwg enter " + path);
-            CleanupPreviousOutputs(path, job, log);
-            Document active = Application.DocumentManager.MdiActiveDocument;
-            Trace("active acquired; filename=" + (active == null ? "<null>" : active.Database.Filename));
-            if (active != null && string.Equals(Path.GetFileName(active.Database.Filename), Path.GetFileName(path), StringComparison.OrdinalIgnoreCase))
-                return ProcessActiveDwg(active.Database, path, job, log);
-            Trace("using side database");
-            return ProcessSideDwg(path, job, log);
+            // Keep the staging root deliberately short. Appending .processing,
+            // the DWG name and the complete source hierarchy under OutputRoot
+            // exceeded the legacy 260-character limit used by AutoCAD 2018 and
+            // .NET 4 before the first page could be plotted.
+            string stageRoot=Path.Combine(Path.GetTempPath(),
+                "DwgPdf_"+Guid.NewGuid().ToString("N"));
+            Job stageJob=CloneJob(job,stageRoot);
+            Directory.CreateDirectory(stageRoot);
+            try
+            {
+                Document active = Application.DocumentManager.MdiActiveDocument;
+                Trace("active acquired; filename=" + (active == null ? "<null>" : active.Database.Filename));
+                int count;
+                if (active != null && string.Equals(Path.GetFileName(active.Database.Filename), Path.GetFileName(path), StringComparison.OrdinalIgnoreCase))
+                    count=ProcessActiveDwg(active.Database,path,stageJob,log);
+                else
+                {
+                    Trace("using side database");
+                    count=ProcessSideDwg(path,stageJob,log);
+                }
+                PublishStagedOutputs(path,job,stageJob,count,log);
+                return count;
+            }
+            finally
+            {
+                try { if(Directory.Exists(stageRoot)) Directory.Delete(stageRoot,true); } catch { }
+            }
+        }
+
+        private static Job CloneJob(Job source,string outputRoot)
+        {
+            return new Job {
+                InputRoot=source.InputRoot,OutputRoot=outputRoot,IncludeModel=source.IncludeModel,
+                Recurse=source.Recurse,Overwrite=true,MinFrameWidth=source.MinFrameWidth,
+                MinFrameHeight=source.MinFrameHeight,MinFrameArea=source.MinFrameArea,
+                MaxFrameArea=source.MaxFrameArea,DetectionMode=source.DetectionMode,
+                DebugFrames=source.DebugFrames,FileNameFilter=source.FileNameFilter,
+                ExactFilePath=source.ExactFilePath
+            };
+        }
+
+        private static void PublishStagedOutputs(string dwg,Job finalJob,Job stageJob,
+            int expectedCount,StringBuilder log)
+        {
+            string inputRoot=Path.GetFullPath(finalJob.InputRoot).TrimEnd(Path.DirectorySeparatorChar);
+            string dwgDirectory=Path.GetDirectoryName(Path.GetFullPath(dwg));
+            string relativeDirectory=dwgDirectory.Length>inputRoot.Length
+                ? dwgDirectory.Substring(inputRoot.Length).TrimStart(Path.DirectorySeparatorChar)
+                : string.Empty;
+            string stageDirectory=Path.Combine(stageJob.OutputRoot,relativeDirectory);
+            string prefix=Safe(Path.GetFileNameWithoutExtension(dwg))+"_";
+            string[] staged=Directory.Exists(stageDirectory)
+                ? Directory.GetFiles(stageDirectory,prefix+"*.pdf") : new string[0];
+            // Zero valid pages is a processing outcome, not a staging failure.
+            // Keep the last known-good final set untouched and let the per-DWG
+            // diagnostics explain whether the source was empty or recognition
+            // produced only blank candidates.
+            if(expectedCount<=0)
+            {
+                log.AppendLine("NO VALID PDF TO PUBLISH; EXISTING OUTPUT PRESERVED "+dwg);
+                return;
+            }
+            if(staged.Length!=expectedCount)
+                throw new InvalidOperationException("暂存PDF数量不一致：识别/验证="+expectedCount+
+                    "，暂存文件="+staged.Length+"。旧输出未被替换。");
+
+            // Verify every staged page before touching the last known-good set.
+            foreach(string file in staged)
+            {
+                string reason;
+                if(IsLikelyBlankPlot(file,out reason))
+                    throw new InvalidOperationException("暂存PDF未通过非空校验："+file+" / "+reason);
+            }
+            CleanupPreviousOutputs(dwg,finalJob,log);
+            string finalDirectory=Path.Combine(finalJob.OutputRoot,relativeDirectory);
+            Directory.CreateDirectory(finalDirectory);
+            foreach(string source in staged.OrderBy(s=>s,StringComparer.OrdinalIgnoreCase))
+            {
+                string desired=Path.Combine(finalDirectory,Path.GetFileName(source));
+                string target=AvailableOutputPath(desired);
+                File.Move(source,target);
+                log.AppendLine("PUBLISH PDF "+target);
+            }
+            if(finalJob.DebugFrames)
+            {
+                string stagedDebug=Path.Combine(stageDirectory,"_FrameDebug");
+                string finalDebug=Path.Combine(finalDirectory,"_FrameDebug");
+                if(Directory.Exists(stagedDebug))
+                {
+                    Directory.CreateDirectory(finalDebug);
+                    foreach(string source in Directory.GetFiles(stagedDebug,"*",SearchOption.AllDirectories))
+                    {
+                        string relative=source.Substring(stagedDebug.Length).TrimStart(Path.DirectorySeparatorChar);
+                        string target=Path.Combine(finalDebug,relative);
+                        Directory.CreateDirectory(Path.GetDirectoryName(target));
+                        if(File.Exists(target)) File.Delete(target);
+                        File.Move(source,target);
+                    }
+                }
+            }
+            log.AppendLine("PUBLISH COMPLETE ["+staged.Length+"] "+dwg);
+            FlushProgressLog(log);
+        }
+
+        private static void FlushProgressLog(StringBuilder log)
+        {
+            if(string.IsNullOrWhiteSpace(CurrentBatchLogPath) || log==null) return;
+            try { File.WriteAllText(CurrentBatchLogPath,log.ToString(),new UTF8Encoding(true)); }
+            catch { }
         }
 
         private static void CleanupPreviousOutputs(string dwg, Job job, StringBuilder log)
@@ -268,6 +374,8 @@ namespace DwgBatchPdf
                                 continue;
                             }
                             DetectionResult detection = DetectFrames(btr, tr, job);
+                            if(!isModel)
+                                RepairPaperSpaceScaleMismatches(detection,btr,tr,log,path,layout.LayoutName);
                             List<Frame> frames = ConsolidateDetectedFrames(detection.Frames,detection.Candidates);
                             detection.Frames=frames;
                             if (job.DebugFrames)
@@ -295,6 +403,11 @@ namespace DwgBatchPdf
                                 {
                                     frames=BuildViewportFallbackFrames(btr,tr);
                                     log.AppendLine("FALLBACK paper viewports ["+frames.Count+"]: "+path+" / "+layout.LayoutName);
+                                    if(frames.Count==0)
+                                    {
+                                        frames=BuildStrictPaperSingleLineFrames(detection,btr,tr,job);
+                                        log.AppendLine("FALLBACK paper single-line outer frames ["+frames.Count+"]: "+path+" / "+layout.LayoutName);
+                                    }
                                     foreach(Frame frame in frames)
                                     {
                                         frame.IsPaperSpace=true;
@@ -326,8 +439,12 @@ namespace DwgBatchPdf
                 // real document. Font substitutions must therefore be applied
                 // to the plotting database as well.
                 PrepareMissingFonts(doc.Database,log);
+                RefreshFontGraphics(doc.Database, doc.Editor, log);
                 for (int i = 0; i < sheets.Count; i++)
                 {
+                        log.AppendLine("PLOT START ["+(i+1)+"/"+sheets.Count+"] "+path+
+                            " / "+sheets[i].Key);
+                        FlushProgressLog(log);
                         KeyValuePair<string, Frame> sheet = sheets[i];
                         ObjectId layoutId;
                         using (Transaction tr = doc.Database.TransactionManager.StartOpenCloseTransaction())
@@ -347,12 +464,17 @@ namespace DwgBatchPdf
                         log.AppendLine("SKIP EMPTY SIDE FRAME "+(i+1)+" "+path+" / "+blankReason);
                     }
                     else validCount++;
+                    log.AppendLine("PLOT COMPLETE ["+(i+1)+"/"+sheets.Count+"] "+path);
+                    FlushProgressLog(log);
                 }
             }
             finally { if (opened) doc.CloseAndDiscard(); }
             if(validCount!=sheets.Count)
-                log.AppendLine("ALERT PDF COUNT MISMATCH: detected frames="+sheets.Count+
-                    ", generated PDFs="+validCount+" / "+path);
+            {
+                log.AppendLine("REJECTED BLANK/PLOT-ERROR CANDIDATES: detected="+sheets.Count+
+                    ", valid PDFs="+validCount+" / "+path);
+                FlushProgressLog(log);
+            }
             return validCount;
         }
 
@@ -372,6 +494,14 @@ namespace DwgBatchPdf
                 log.AppendLine("WARN XREF RESOLVE " + path + " / " + ex.Message);
             }
             PrepareMissingFonts(db, log);
+            Editor activeEditor=null;
+            try
+            {
+                Document activeDocument=Application.DocumentManager.MdiActiveDocument;
+                if(activeDocument!=null && activeDocument.Database==db) activeEditor=activeDocument.Editor;
+            }
+            catch { }
+            RefreshFontGraphics(db,activeEditor,log);
             var sheets = new List<KeyValuePair<string, Frame>>();
             using (Transaction tr = db.TransactionManager.StartTransaction())
             {
@@ -394,6 +524,8 @@ namespace DwgBatchPdf
                     }
                     Trace("before DetectFrames");
                     DetectionResult detection = DetectFrames(btr, tr, job);
+                    if(!layout.ModelType)
+                        RepairPaperSpaceScaleMismatches(detection,btr,tr,log,path,layout.LayoutName);
                     List<Frame> frames = ConsolidateDetectedFrames(detection.Frames,detection.Candidates);
                     detection.Frames=frames;
                     if (job.DebugFrames)
@@ -420,6 +552,11 @@ namespace DwgBatchPdf
                             // paper entities (border/title block) instead.
                             frames=BuildViewportFallbackFrames(btr,tr);
                             log.AppendLine("FALLBACK paper viewports ["+frames.Count+"]: "+path+" / "+layout.LayoutName);
+                            if(frames.Count==0)
+                            {
+                                frames=BuildStrictPaperSingleLineFrames(detection,btr,tr,job);
+                                log.AppendLine("FALLBACK paper single-line outer frames ["+frames.Count+"]: "+path+" / "+layout.LayoutName);
+                            }
                             foreach(Frame viewportFrame in frames)
                             {
                                 viewportFrame.IsPaperSpace=true;
@@ -466,6 +603,9 @@ namespace DwgBatchPdf
             for (int i = 0; i < sheets.Count; i++)
             {
                 Trace("before plot " + (i + 1));
+                log.AppendLine("PLOT START ["+(i+1)+"/"+sheets.Count+"] "+path+
+                    " / "+sheets[i].Key);
+                FlushProgressLog(log);
                 KeyValuePair<string, Frame> sheet = sheets[i];
                 ObjectId layoutId;
                 using (Transaction tr = db.TransactionManager.StartOpenCloseTransaction())
@@ -519,6 +659,8 @@ namespace DwgBatchPdf
                     log.AppendLine("SKIP EMPTY FRAME " + (i + 1) + " " + path+" / "+blankReason);
                 }
                 else valid.Add(Tuple.Create(sheet.Key,sheet.Value,output));
+                log.AppendLine("PLOT COMPLETE ["+(i+1)+"/"+sheets.Count+"] "+path);
+                FlushProgressLog(log);
             }
             // Rename after validation so removed empty candidates do not leave numbering gaps.
             for (int i = 0; i < valid.Count; i++)
@@ -533,13 +675,14 @@ namespace DwgBatchPdf
             log.AppendLine("VALID PDFS [" + valid.Count + "] " + path);
             if(valid.Count!=sheets.Count)
             {
-                string message="PDF COUNT MISMATCH: detected frames="+sheets.Count+
-                    ", generated PDFs="+valid.Count+" / "+path;
-                log.AppendLine("ALERT "+message);
-                // Preserve successful pages and continue the batch. A legacy
-                // layout that rejects Window plotting must not invalidate the
-                // complete ModelSpace sheets already generated for this DWG.
-                if(valid.Count==0) throw new InvalidOperationException(message);
+                // A detected rectangle is still only a candidate.  If AutoCAD
+                // produces its conservative blank-page signature, reject that
+                // candidate instead of turning the whole DWG into an exception.
+                // Genuine non-empty pages remain staged and are published as one
+                // atomic set; rejected pages are never copied to final output.
+                log.AppendLine("REJECTED BLANK/PLOT-ERROR CANDIDATES: detected="+sheets.Count+
+                    ", valid PDFs="+valid.Count+" / "+path);
+                FlushProgressLog(log);
             }
             return valid.Count;
         }
@@ -814,6 +957,7 @@ namespace DwgBatchPdf
         {
             List<Frame> namedFrames=DetectNamedFrameBlocks(space,tr,job);
             List<Frame> repeatedOuterFrames=DetectRepeatedOuterFrameFamily(space,tr,job);
+            var repeatedCandidates=repeatedOuterFrames.ToList();
             // Repetition alone is not sheet evidence. LV switchboard drawings
             // contain many repeated equipment cells and schematic modules whose
             // outlines form convincing rectangular families. Require a title-bar
@@ -848,8 +992,70 @@ namespace DwgBatchPdf
                     frame.IsValid=true;
                     frame.Decision="valid-repeated-host-outer-frame";
                 }
+                var supplementalCandidates=new List<Frame>();
+
+                // A proven repeated family is only the first set of sheets. A
+                // DWG may also contain one A1/A2, portrait or elongated sheet.
+                // Detect those one-off sizes independently instead of requiring
+                // them to match the repeated family's dimensions. This pass is
+                // deliberately strict: complete/double border + title signature
+                // + text + spatial independence are all mandatory.
+                List<Frame> independent=DetectIndependentTitledOuterFrames(
+                    space,tr,job,repeatedOuterFrames,supplementalCandidates);
+                foreach(Frame candidate in independent)
+                    repeatedOuterFrames.Add(candidate);
+
+                // Named title-frame blocks are reliable sheet locators even when
+                // their one-off size has no repeated contour family. Calibrate
+                // them to the physical outer border, but never use the locator's
+                // own sidebar extent as a page and never admit a border containing
+                // more than one locator or more than one already accepted sheet.
+                if(namedFrames.Count>0)
+                {
+                    namedFrames=namedFrames.OrderByDescending(f=>f.Area)
+                        .Aggregate(new List<Frame>(),(list,f)=>
+                        { if(!list.Any(x=>FrameOverlap(x,f)>.90)) list.Add(f); return list; });
+                    var locatorCenters=namedFrames.Select(f=>f.Center).ToList();
+                    foreach(Frame f in namedFrames) { f.IsValid=true;f.Decision="named-frame-locator"; }
+                    CalibrateBlockFramesToOuterBorders(space,tr,namedFrames,job);
+                    foreach(Frame candidate in namedFrames)
+                    {
+                        supplementalCandidates.Add(candidate);
+                        int enclosedLocators=locatorCenters.Count(p=>PointInsideLoose(candidate,p));
+                        int enclosedSheets=repeatedOuterFrames.Count(f=>PointInsideLoose(candidate,f.Center));
+                        bool overlapsExisting=repeatedOuterFrames.Any(f=>
+                            FrameIntersectionOverSmaller(f,candidate)>.55 ||
+                            ContainsFrame(f,candidate) || ContainsFrame(candidate,f));
+                        if(!candidate.IsValid ||
+                           candidate.Decision=="valid-block-sheet-border-not-found" ||
+                           enclosedLocators!=1 || enclosedSheets>0 || overlapsExisting)
+                        {
+                            candidate.IsValid=false;
+                            candidate.Decision=enclosedLocators>1 || enclosedSheets>1
+                                ? "rejected-singleton-border-contains-multiple-sheets"
+                                : overlapsExisting ? "rejected-singleton-duplicate-existing-sheet"
+                                : "rejected-singleton-named-locator-without-complete-border";
+                            continue;
+                        }
+                        candidate.IsValid=true;
+                        candidate.Decision="valid-singleton-different-size-named-frame";
+                        repeatedOuterFrames.Add(candidate);
+                    }
+                }
+
+                repeatedOuterFrames=RemoveOverlappingSheetBoundaries(repeatedOuterFrames);
+                repeatedOuterFrames.Sort((a,b)=>
+                {
+                    double rowTolerance=Math.Min(a.Height,b.Height)*.35;
+                    double dy=b.Center.Y-a.Center.Y;
+                    return Math.Abs(dy)>rowTolerance ? Math.Sign(dy) : a.Center.X.CompareTo(b.Center.X);
+                });
+                Trace("mixed-size sheet result: repeated="+
+                    repeatedCandidates.Count(f=>f.IsValid)+" independent="+independent.Count+
+                    " final="+repeatedOuterFrames.Count);
                 return new DetectionResult { Frames=repeatedOuterFrames,
-                    Candidates=namedFrames.Concat(repeatedOuterFrames).ToList() };
+                    Candidates=namedFrames.Concat(repeatedCandidates)
+                        .Concat(supplementalCandidates).Distinct().ToList() };
             }
             if(namedFrames.Count>0)
             {
@@ -913,7 +1119,7 @@ namespace DwgBatchPdf
                 // Do not reinterpret a proven family of repeated equipment cells
                 // as sheets through the expensive arbitrary-block fallback.
                 Trace("skip arbitrary block fallback after small-component family rejection");
-                return new DetectionResult { Frames=new List<Frame>(),Candidates=repeatedOuterFrames };
+                return new DetectionResult { Frames=new List<Frame>(),Candidates=repeatedCandidates };
             }
             // No title/sidebar locator exists: only complete closed rectangular
             // borders may define sheets. Never infer page count from arbitrary
@@ -1097,8 +1303,22 @@ namespace DwgBatchPdf
             List<Frame> closedFamily=SelectRepeatedOuterFrameFamily(all,texts,job);
             if(closedFamily.Count>0 && RepeatedFamilyHasSheetScale(closedFamily,segments,texts))
             {
+                // Do not return immediately.  A repeated run of closed borders
+                // may contain one hand-drawn sheet whose PLINE is broken into
+                // LINE entities.  Completing only the already-proven family is
+                // linear/bounded and avoids the old global O(n^2) reconstruction.
+                int beforeCompletion=closedFamily.Count;
+                // CollectBorderSegments also expands straight PLINE edges and
+                // nested non-XREF blocks. CollectRectangles' `segments` list only
+                // contains standalone LINE entities and therefore missed a fifth
+                // sheet when its border was a polyline or split by a title block.
+                var completionSegments=new List<LineSegment>();
+                CollectBorderSegments(space,tr,Matrix3d.Identity,0,completionSegments);
+                CompleteRepeatedFamilyFromSegments(closedFamily,completionSegments,texts,job);
                 Trace("repeated outer: closed family="+closedFamily.Count+" elapsed="+
-                    (DateTime.UtcNow-started).TotalSeconds.ToString("0.0",CultureInfo.InvariantCulture)+"s");
+                    (DateTime.UtcNow-started).TotalSeconds.ToString("0.0",CultureInfo.InvariantCulture)+
+                    "s completionSegments="+completionSegments.Count+
+                    " completed="+(closedFamily.Count-beforeCompletion));
                 return closedFamily;
             }
 
@@ -1181,16 +1401,16 @@ namespace DwgBatchPdf
 
         private static List<Frame> SelectRepeatedOuterFrameFamily(List<Frame> all,List<Point2d> texts,Job job)
         {
-            var eligible=all.Where(f=>
+            var dimensionEligible=all.Where(f=>
             {
                 double shortSide=Math.Min(f.Width,f.Height),longSide=Math.Max(f.Width,f.Height);
                 return f.SourceDepth<=1 &&
                     f.Width>=job.MinFrameWidth && f.Height>=job.MinFrameHeight &&
                     longSide/Math.Max(1.0,shortSide)>=1.05 && longSide/Math.Max(1.0,shortSide)<=8.0 &&
                     (job.MinFrameArea<=0 || f.Area>=job.MinFrameArea) &&
-                    (job.MaxFrameArea<=0 || f.Area<=job.MaxFrameArea) &&
-                    texts.Count(p=>PointInside(f,p))>=2;
+                    (job.MaxFrameArea<=0 || f.Area<=job.MaxFrameArea);
             }).ToList();
+            var eligible=dimensionEligible.Where(f=>texts.Count(p=>PointInside(f,p))>=2).ToList();
             if(eligible.Count<2) return new List<Frame>();
 
             // Group hand-drawn frames by dimensions with a 5% tolerance. Score
@@ -1228,12 +1448,29 @@ namespace DwgBatchPdf
             Trace("repeated outer groups="+string.Join(",",selectedGroups.Select(g=>
                 g.Count+"x"+g[0].Width.ToString("0.##",CultureInfo.InvariantCulture)+"x"+
                 g[0].Height.ToString("0.##",CultureInfo.InvariantCulture))));
+            var proven=selectedGroups.SelectMany(g=>g).ToList();
+            // Repetition proves that a sheet family exists; it must not also be
+            // required of every member.  A fifth border with a small hand-drawn
+            // size difference otherwise forms a one-item group and disappears.
+            // Admit such a member only when it matches a proven family, contains
+            // text and lies in the same row/column pattern.  The later title-bar
+            // signature check remains mandatory, so detail boxes cannot become
+            // pages merely because their dimensions happen to be similar.
+            var singletonMembers=dimensionEligible.Where(f=>!proven.Contains(f) &&
+                    texts.Count(p=>PointInside(f,p))>=2 &&
+                    selectedGroups.Any(g=>MatchesRepeatedFamilyDimensions(f,g,.12)) &&
+                    AlignedWithRepeatedFamily(f,proven))
+                .ToList();
+            Trace("repeated outer singleton members="+singletonMembers.Count+
+                " dimensionEligible="+dimensionEligible.Count+" textEligible="+eligible.Count);
             var result=new List<Frame>();
-            foreach(Frame frame in selectedGroups.SelectMany(g=>g).OrderByDescending(f=>f.Area))
+            foreach(Frame frame in proven.Concat(singletonMembers).OrderByDescending(f=>f.Area))
             {
                 if(result.Any(r=>FrameIntersectionOverSmaller(r,frame)>.80)) continue;
                 frame.IsValid=true;
-                frame.Decision="valid-repeated-outer-frame-family";
+                frame.Decision=singletonMembers.Contains(frame)
+                    ? "valid-repeated-outer-frame-family-singleton-member"
+                    : "valid-repeated-outer-frame-family";
                 frame.Source="RepeatedHostOuterFrame";
                 result.Add(frame);
             }
@@ -1243,6 +1480,209 @@ namespace DwgBatchPdf
                 double dy=b.Center.Y-a.Center.Y;
                 return Math.Abs(dy)>rowTolerance ? Math.Sign(dy) : a.Center.X.CompareTo(b.Center.X);
             });
+            return result;
+        }
+
+        private static bool MatchesRepeatedFamilyDimensions(Frame frame,List<Frame> family,double tolerance)
+        {
+            if(family==null || family.Count==0) return false;
+            Frame sample=family.OrderBy(f=>f.Area).ElementAt(family.Count/2);
+            return Math.Abs(sample.Width-frame.Width)/Math.Max(sample.Width,frame.Width)<=tolerance &&
+                   Math.Abs(sample.Height-frame.Height)/Math.Max(sample.Height,frame.Height)<=tolerance &&
+                   AngleDifference(sample.Angle,frame.Angle)<.04;
+        }
+
+        private static bool AlignedWithRepeatedFamily(Frame candidate,List<Frame> family)
+        {
+            if(family==null || family.Count<2) return false;
+            int sameColumn=family.Count(f=>Math.Abs(f.Center.X-candidate.Center.X)<=
+                Math.Max(f.Width,candidate.Width)*.15);
+            int sameRow=family.Count(f=>Math.Abs(f.Center.Y-candidate.Center.Y)<=
+                Math.Max(f.Height,candidate.Height)*.15);
+            return sameColumn>=2 || sameRow>=2;
+        }
+
+        private static void CompleteRepeatedFamilyFromSegments(List<Frame> family,List<LineSegment> segments,
+            List<Point2d> texts,Job job)
+        {
+            if(family==null || family.Count<2 || segments==null || segments.Count==0) return;
+            Frame sample=family.OrderBy(f=>f.Area).ElementAt(family.Count/2);
+            if(AngleDifference(sample.Angle,0)>.04) return;
+            double width=sample.Width,height=sample.Height;
+            double widthTol=width*.12,heightTol=height*.12;
+            var rawHs=segments.Where(s=>s.SourceDepth<=2 &&
+                Math.Abs(s.A.Y-s.B.Y)<=Math.Max(Math.Abs(s.A.X-s.B.X),1.0)*.003 &&
+                Math.Abs(s.A.X-s.B.X)>=Math.Max(job.MinFrameWidth*.05,width*.08)).ToList();
+            // Rejoin collinear border pieces interrupted by nested title blocks.
+            // Only merged spans close to the proven family width are retained.
+            var hs=rawHs.Concat(MergeHorizontalBorderSegments(rawHs,job.MinFrameWidth,job.MinFrameHeight))
+                .Where(s=>Math.Abs(Math.Abs(s.A.X-s.B.X)-width)<=widthTol)
+                .OrderByDescending(s=>Math.Abs(s.A.X-s.B.X)).Take(1200).ToList();
+            var vs=segments.Where(s=>s.SourceDepth<=2 &&
+                Math.Abs(s.A.X-s.B.X)<=Math.Max(Math.Abs(s.A.Y-s.B.Y),1.0)*.003)
+                .Take(4000).ToList();
+            int considered=0,accepted=0;
+            for(int i=0;i<hs.Count;i++)
+            {
+                double ax1=Math.Min(hs[i].A.X,hs[i].B.X),ax2=Math.Max(hs[i].A.X,hs[i].B.X);
+                double ay=(hs[i].A.Y+hs[i].B.Y)/2.0;
+                for(int j=i+1;j<hs.Count;j++)
+                {
+                    if(++considered>250000) break;
+                    double bx1=Math.Min(hs[j].A.X,hs[j].B.X),bx2=Math.Max(hs[j].A.X,hs[j].B.X);
+                    double by=(hs[j].A.Y+hs[j].B.Y)/2.0;
+                    double candidateHeight=Math.Abs(ay-by);
+                    if(Math.Abs(candidateHeight-height)>heightTol) continue;
+                    double left=(ax1+bx1)/2.0,right=(ax2+bx2)/2.0;
+                    if(Math.Abs(ax1-bx1)>width*.04 || Math.Abs(ax2-bx2)>width*.04) continue;
+                    double bottom=Math.Min(ay,by),top=Math.Max(ay,by);
+                    var candidate=new Frame { Center=new Point2d((left+right)/2.0,(bottom+top)/2.0),
+                        Width=right-left,Height=top-bottom,Angle=0,SourceDepth=0,
+                        Source="RepeatedHostOuterFrame",Decision="candidate-repeated-family-line-completion" };
+                    if(!MatchesRepeatedFamilyDimensions(candidate,family,.12) ||
+                       !AlignedWithRepeatedFamily(candidate,family) ||
+                       family.Any(f=>FrameIntersectionOverSmaller(f,candidate)>.80) ||
+                       texts.Count(p=>PointInside(candidate,p))<2) continue;
+                    double sideTol=Math.Max(width*.01,job.MinFrameWidth*.03);
+                    double leftCoverage=VerticalCoverageRatio(vs,left,bottom,top,sideTol);
+                    double rightCoverage=VerticalCoverageRatio(vs,right,bottom,top,sideTol);
+                    // Two complete horizontal sides plus strong evidence on both
+                    // vertical sides.  Small corner gaps are tolerated, but an
+                    // internal horizontal band or diagonal drawing line cannot
+                    // satisfy this test.
+                    if(leftCoverage<.55 || rightCoverage<.55 || leftCoverage+rightCoverage<1.30) continue;
+                    candidate.IsValid=true;
+                    candidate.Decision="valid-repeated-outer-frame-family-line-completion";
+                    candidate.StrongOuterEvidence=true;
+                    family.Add(candidate);
+                    accepted++;
+                }
+                if(considered>250000) break;
+            }
+            family.Sort((a,b)=>
+            {
+                double rowTolerance=Math.Min(a.Height,b.Height)*.35;
+                double dy=b.Center.Y-a.Center.Y;
+                return Math.Abs(dy)>rowTolerance ? Math.Sign(dy) : a.Center.X.CompareTo(b.Center.X);
+            });
+            Trace("repeated family local completion considered="+considered+" accepted="+accepted);
+        }
+
+        private static List<Frame> DetectIndependentTitledOuterFrames(BlockTableRecord space,Transaction tr,
+            Job job,List<Frame> accepted,List<Frame> diagnostics)
+        {
+            DateTime started=DateTime.UtcNow;
+            var rectangles=new List<Frame>();
+            var segments=new List<LineSegment>();
+            var texts=new List<Point2d>();
+            var marks=new List<TextMark>();
+            CollectRectangles(space,tr,Matrix3d.Identity,0,job.MinFrameWidth,job.MinFrameHeight,
+                rectangles,segments,texts);
+            CollectTextMarks(space,tr,Matrix3d.Identity,0,marks);
+
+            // Preserve bounded behaviour on very dense engineering models. The
+            // closed-polyline candidates remain usable; only combinatorial LINE
+            // pairing is skipped above the established safe limit.
+            bool oversized=segments.Count>60000 || rectangles.Count>10000;
+            if(!oversized)
+            {
+                AddLineRectangles(segments,job.MinFrameWidth,job.MinFrameHeight,rectangles);
+                AddDoubleHorizontalBandRectangles(segments,job.MinFrameWidth,job.MinFrameHeight,rectangles);
+            }
+            else Trace("singleton different-size LINE reconstruction skipped: rectangles="+
+                rectangles.Count+" segments="+segments.Count);
+
+            double repeatedMedian=accepted.Count==0 ? 0 :
+                accepted.OrderBy(f=>f.Area).ElementAt(accepted.Count/2).Area;
+            var evaluated=new List<Frame>();
+            // Real sheets are among the largest host rectangles. In a very large
+            // model inspect only the largest closed candidates and never perform
+            // per-candidate scans over hundreds of thousands of LINE entities.
+            // The already proven repeated families remain untouched.
+            int candidateLimit=oversized ? 200 : 3000;
+            var candidatePool=rectangles.OrderByDescending(f=>f.Area).Take(candidateLimit).ToList();
+            int processed=0;
+            foreach(Frame candidate in candidatePool)
+            {
+                processed++;
+                if((DateTime.UtcNow-started).TotalSeconds>20.0)
+                {
+                    Trace("singleton different-size time budget reached; processed="+processed+
+                        "/"+candidatePool.Count+" accepted="+evaluated.Count);
+                    break;
+                }
+                if(processed%25==0)
+                    Trace("singleton different-size progress="+processed+"/"+candidatePool.Count+
+                        " accepted="+evaluated.Count);
+                candidate.IsValid=false;
+                candidate.Decision="singleton-different-size-candidate";
+                double shortSide=Math.Min(candidate.Width,candidate.Height);
+                double longSide=Math.Max(candidate.Width,candidate.Height);
+                double ratio=longSide/Math.Max(shortSide,1.0);
+                if(candidate.Width<job.MinFrameWidth || candidate.Height<job.MinFrameHeight)
+                { candidate.Decision="rejected-singleton-below-minimum-size";continue; }
+                if(job.MinFrameArea>0 && candidate.Area<job.MinFrameArea)
+                { candidate.Decision="rejected-singleton-below-minimum-area";continue; }
+                if(job.MaxFrameArea>0 && candidate.Area>job.MaxFrameArea)
+                { candidate.Decision="rejected-singleton-above-maximum-area";continue; }
+                if(ratio<1.05 || ratio>8.0)
+                { candidate.Decision="rejected-singleton-invalid-aspect";continue; }
+                // This relative floor is only a prefilter. A3 beside A0 remains
+                // eligible (roughly 12.5% area), while tiny title cells/equipment
+                // modules are discarded before expensive evidence checks.
+                if(repeatedMedian>0 && candidate.Area<repeatedMedian*.04)
+                { candidate.Decision="rejected-singleton-component-scale";continue; }
+
+                // Cheap spatial rejection must precede text/title/border scans.
+                // Most large candidates in dense schematics are duplicate inner
+                // or outer borders around an already accepted repeated sheet.
+                int enclosedAccepted=accepted.Count(f=>PointInsideLoose(candidate,f.Center));
+                if(enclosedAccepted>0)
+                {
+                    candidate.Decision=enclosedAccepted>1
+                        ? "rejected-singleton-wrapper-contains-multiple-sheets"
+                        : "rejected-singleton-overlaps-existing-sheet";
+                    continue;
+                }
+                bool overlap=accepted.Any(f=>ContainsFrame(f,candidate) ||
+                    ContainsFrame(candidate,f) || FrameIntersectionOverSmaller(f,candidate)>.55);
+                if(overlap)
+                { candidate.Decision="rejected-singleton-duplicate-existing-sheet";continue; }
+
+                if(texts.Count(p=>PointInside(candidate,p))<2)
+                { candidate.Decision="rejected-singleton-insufficient-text";continue; }
+                if(!HasTitleSignature(candidate,marks))
+                { candidate.Decision="rejected-singleton-no-title-signature";continue; }
+
+                bool hasBorderEvidence=candidate.StrongOuterEvidence ||
+                    rectangles.Any(inner=>!object.ReferenceEquals(inner,candidate) &&
+                        IsInnerBorder(candidate,inner)) ||
+                    (!oversized && HasInnerBorderEvidence(candidate,segments,
+                        job.MinFrameWidth,job.MinFrameHeight));
+                if(!hasBorderEvidence)
+                { candidate.Decision="rejected-singleton-no-double-border-evidence";continue; }
+
+                candidate.IsValid=true;
+                candidate.Decision="valid-singleton-different-size-titled-outer-frame";
+                candidate.Source="SingletonDifferentSizeOuterFrame";
+                evaluated.Add(candidate);
+            }
+
+            // For one physical sheet the outer and inner border can both satisfy
+            // the strict tests. Largest-first overlap consolidation retains the
+            // complete outer frame. Spatially separate mixed-size sheets remain.
+            List<Frame> result=RemoveOverlappingSheetBoundaries(evaluated);
+            foreach(Frame frame in evaluated.Where(f=>!result.Contains(f) && f.IsValid))
+            {
+                frame.IsValid=false;
+                frame.Decision="rejected-singleton-inner-or-duplicate-border";
+            }
+            diagnostics.AddRange(candidatePool.Where(f=>
+                f.IsValid || (f.Decision!=null && f.Decision.StartsWith("rejected-singleton",StringComparison.Ordinal))));
+            Trace("singleton different-size collected="+rectangles.Count+" pool="+candidatePool.Count+
+                " processed="+processed+" oversized="+oversized+
+                " titledCandidates="+evaluated.Count+" accepted="+result.Count+
+                " elapsed="+(DateTime.UtcNow-started).TotalSeconds.ToString("0.0",CultureInfo.InvariantCulture)+"s");
             return result;
         }
 
@@ -1478,7 +1918,7 @@ namespace DwgBatchPdf
                     if(LooksLikeFrameName(name))
                     {
                         Frame frame;
-                        bool exact=TryGetRobustFrameFromBlock(definition,tr,worldTransform,job,depth,out frame);
+                        bool exact=TryGetRobustFrameFromBlock(definition,tr,worldTransform,job,depth,name,out frame);
                         if(!exact) TryGetTrimmedFrameFromBlock(definition,tr,worldTransform,job,depth,out frame);
                         // Finding a named frame block and reconstructing its border
                         // are separate decisions. Never discard RCJM1-TK-A0 merely
@@ -1501,7 +1941,7 @@ namespace DwgBatchPdf
         }
 
         private static bool TryGetRobustFrameFromBlock(BlockTableRecord definition,Transaction tr,Matrix3d transform,
-            Job job,int sourceDepth,out Frame frame)
+            Job job,int sourceDepth,string blockName,out Frame frame)
         {
             frame=null;
             var segments=new List<LineSegment>();
@@ -1530,10 +1970,15 @@ namespace DwgBatchPdf
                     double width=right-left,height=top-bottom;
                     if(width<job.MinFrameWidth || height<job.MinFrameHeight) continue;
                     double ratio=Math.Max(width,height)/Math.Min(width,height);
-                    if(ratio<1.05 || ratio>8.0) continue;
+                    // A named A-series border must remain close to the ISO paper
+                    // ratio. Long schematic/equipment lines inside the block can
+                    // otherwise form a convincing but very tall rectangle.
+                    bool aSeries=IsAseriesFrameName(blockName);
+                    if(ratio<1.05 || ratio>8.0 || (aSeries && (ratio<1.20 || ratio>1.72))) continue;
                     double tol=Math.Max(width*.04,job.MinFrameWidth*.05);
                     double lc=VerticalCoverageRatio(vs,left,bottom,top,tol),rc=VerticalCoverageRatio(vs,right,bottom,top,tol);
                     if(lc<.20 || rc<.20 || lc+rc<.55) continue;
+                    if(aSeries && (lc<.55 || rc<.55 || lc+rc<1.30)) continue;
                     double area=width*height;
                     if(job.MinFrameArea>0 && area<job.MinFrameArea) continue;
                     if(job.MaxFrameArea>0 && area>job.MaxFrameArea) continue;
@@ -1744,6 +2189,11 @@ namespace DwgBatchPdf
             {
                 Frame anchor=new Frame { Center=frame.Center,Width=frame.Width,Height=frame.Height,Angle=0 };
                 double anchorLong=Math.Max(anchor.Width,anchor.Height);
+                bool aSeriesNamed=IsAseriesFrameName(frame.Source);
+                double isoRatio=Math.Sqrt(2.0);
+                double anchorRatio=Math.Max(anchor.Width,anchor.Height)/
+                    Math.Max(1.0,Math.Min(anchor.Width,anchor.Height));
+                bool anchorIsCompleteAseries=aSeriesNamed && anchorRatio>=1.20 && anchorRatio<=1.72;
                 // The locator may be only a small title block. Do not cap the
                 // surrounding sheet to roughly the locator's own dimensions.
                 double minSpan=Math.Max(job.MinFrameWidth*2.0,anchorLong*.12);
@@ -1776,12 +2226,15 @@ namespace DwgBatchPdf
                 {
                     double ratio=Math.Max(r.Width,r.Height)/Math.Max(1.0,Math.Min(r.Width,r.Height));
                     return r.Area>anchor.Area*1.20 && r.Width<=maxSpan && r.Height<=maxSpan && ratio<=8.0 &&
+                        (!aSeriesNamed || (ratio>=1.20 && ratio<=1.72)) &&
                         PointInside(r,frame.Center) &&
                         locatorCenters.Count(p=>PointInsideLoose(r,p))==1 &&
                         FrameInsideLocatorCell(r,frame.Center,locatorCenters);
                 }).OrderByDescending(r=>r.Area).FirstOrDefault();
                 double bestScore=best==null ? double.MinValue :
-                    Math.Log(1.0+best.Area/Math.Max(anchor.Area,1.0))*1000.0+500.0;
+                    Math.Log(1.0+best.Area/Math.Max(anchor.Area,1.0))*1000.0+500.0-
+                    (aSeriesNamed ? Math.Abs(Math.Max(best.Width,best.Height)/
+                        Math.Max(1.0,Math.Min(best.Width,best.Height))-isoRatio)*4000.0 : 0.0);
                 for(int ei=0;ei<nearby.Count;ei++)
                 {
                     LineSegment first=nearby[ei];
@@ -1799,6 +2252,11 @@ namespace DwgBatchPdf
                         double left=Math.Min(ax1,bx1),right=Math.Max(ax2,bx2),width=right-left;
                         double ratio=Math.Max(width,height)/Math.Min(width,height);
                         if(ratio<1.05 || ratio>8.0 || width>maxSpan || height>maxSpan) continue;
+                        if(aSeriesNamed && (ratio<1.20 || ratio>1.72)) continue;
+                        double topCoverage=Math.Min(1.0,(Math.Max(ax2,bx2)-Math.Min(ax1,bx1))/Math.Max(width,1e-9));
+                        double bottomCoverage=Math.Min(1.0,shorter/Math.Max(width,1e-9));
+                        double sharedHorizontalCoverage=overlap/Math.Max(width,1e-9);
+                        if(aSeriesNamed && (topCoverage<.80 || bottomCoverage<.80 || sharedHorizontalCoverage<.75)) continue;
                         double sideTol=Math.Max(width*.035,job.MinFrameWidth*.05);
                         double leftCoverage=VerticalCoverageRatio(localVerticals,left,bottom,top,sideTol);
                         double rightCoverage=VerticalCoverageRatio(localVerticals,right,bottom,top,sideTol);
@@ -1806,6 +2264,8 @@ namespace DwgBatchPdf
                         // sides must be materially present. A horizontal internal
                         // line pair alone can never crop a drawing.
                         if(leftCoverage<.25 || rightCoverage<.25 || leftCoverage+rightCoverage<.70) continue;
+                        if(aSeriesNamed && (leftCoverage<.60 || rightCoverage<.60 ||
+                            leftCoverage+rightCoverage<1.35)) continue;
                         var proposed=new Frame {
                             Center=new Point2d((left+right)/2.0,(top+bottom)/2.0),Width=width,Height=height,
                             Angle=0,SourceDepth=frame.SourceDepth,Source=frame.Source,
@@ -1834,6 +2294,19 @@ namespace DwgBatchPdf
                         int textCount=textPoints.Count(p=>PointInside(proposed,p));
                         double anchorDistance=Distance(proposed.Center,anchor.Center)/Math.Max(anchorLong,1.0);
                         double relativeArea=proposed.Area/Math.Max(anchor.Area,1.0);
+                        // If the named block already supplied a credible complete
+                        // A-series frame, calibration may only make a modest
+                        // correction. This prevents a remote drawing line from
+                        // flipping the sheet orientation or creating huge blank
+                        // space. Sidebar-only locators still use the unrestricted
+                        // outward search, subject to the four-side tests above.
+                        if(anchorIsCompleteAseries)
+                        {
+                            bool orientationChanged=(anchor.Width>=anchor.Height)!=(proposed.Width>=proposed.Height);
+                            if(orientationChanged || relativeArea>1.50 || relativeArea<.80) continue;
+                            if(Math.Abs(proposed.Width-anchor.Width)/Math.Max(anchor.Width,1.0)>.18 ||
+                               Math.Abs(proposed.Height-anchor.Height)/Math.Max(anchor.Height,1.0)>.18) continue;
+                        }
                         // Prefer the largest credible closure. Dense text inside a
                         // small internal box is only weak supporting evidence.
                         // Exactly-one-locator validation above already rejects a
@@ -1842,7 +2315,8 @@ namespace DwgBatchPdf
                         // line of a single/double frame rather than its inner line.
                         double score=Math.Log(1.0+Math.Max(relativeArea,0))*1000.0+
                             (leftCoverage+rightCoverage)*100.0+
-                            Math.Min(textCount,1000)*.02-anchorDistance*10.0;
+                            Math.Min(textCount,1000)*.02-anchorDistance*10.0-
+                            (aSeriesNamed ? Math.Abs(ratio-isoRatio)*4000.0 : 0.0);
                         if(score>bestScore)
                         {
                             bestScore=score;
@@ -1855,8 +2329,10 @@ namespace DwgBatchPdf
                     frame.Center=best.Center;
                     // Retain imperfect corners, lineweight and text touching the
                     // manually drawn outer frame.
-                    frame.Width=best.Width*1.025;
-                    frame.Height=best.Height*1.025;
+                    // Only compensate for lineweight/numeric tolerance. A 2.5%
+                    // expansion can expose part of an adjacent touching sheet.
+                    frame.Width=best.Width*1.003;
+                    frame.Height=best.Height*1.003;
                     frame.Angle=0;
                     // The old outline belongs to the locator block, not to the
                     // newly reconstructed outer border. Keeping it here made the
@@ -1871,8 +2347,6 @@ namespace DwgBatchPdf
                 }
                 else
                 {
-                    double anchorRatio=Math.Max(anchor.Width,anchor.Height)/
-                        Math.Max(1.0,Math.Min(anchor.Width,anchor.Height));
                     if(anchorRatio>=1.25 && anchorRatio<=1.65 &&
                         anchor.Width>=job.MinFrameWidth && anchor.Height>=job.MinFrameHeight)
                     {
@@ -2183,6 +2657,146 @@ namespace DwgBatchPdf
             return kept;
         }
 
+        private static void RepairPaperSpaceScaleMismatches(DetectionResult detection,
+            BlockTableRecord space,Transaction tr,StringBuilder log,string path,string layoutName)
+        {
+            if(detection==null || detection.Frames==null || detection.Frames.Count==0) return;
+            var liveViewports=new List<Viewport>();
+            foreach(ObjectId id in space)
+            {
+                Viewport vp=tr.GetObject(id,OpenMode.ForRead,false) as Viewport;
+                if(vp!=null && vp.Number>1 && vp.On && vp.Width>1e-6 && vp.Height>1e-6)
+                    liveViewports.Add(vp);
+            }
+            if(liveViewports.Count==0) return;
+
+            List<Frame> frames=detection.Frames.Where(f=>f!=null && f.IsValid).ToList();
+            var mainForFrame=new List<Viewport>();
+            for(int i=0;i<frames.Count;i++)
+            {
+                Frame owner=frames[i];
+                Viewport best=null;
+                double bestArea=0;
+                foreach(Viewport vp in liveViewports)
+                {
+                    Point2d center=new Point2d(vp.CenterPoint.X,vp.CenterPoint.Y);
+                    if(!PointInsideLoose(owner,center)) continue;
+                    int nearest=0;
+                    double nearestDistance=double.MaxValue;
+                    for(int j=0;j<frames.Count;j++)
+                    {
+                        double distance=Distance(center,frames[j].Center);
+                        if(distance<nearestDistance) { nearestDistance=distance;nearest=j; }
+                    }
+                    if(nearest!=i) continue;
+                    double area=vp.Width*vp.Height;
+                    if(area>bestArea) { bestArea=area;best=vp; }
+                }
+                mainForFrame.Add(best);
+            }
+
+            for(int i=0;i<frames.Count;i++)
+            {
+                Frame frame=frames[i];
+                Viewport main=mainForFrame[i];
+                if(main==null || frame.Source==null ||
+                   !frame.Source.StartsWith("NamedFrame",StringComparison.OrdinalIgnoreCase)) continue;
+                double widthScale=frame.Width/Math.Max(main.Width,1e-9);
+                double heightScale=frame.Height/Math.Max(main.Height,1e-9);
+                // Require an extreme mismatch in BOTH directions. A legitimate
+                // sheet can contain a relatively small viewport, but an A-series
+                // border inserted at 50/100/150 scale is orders of magnitude
+                // larger than every paper viewport in the same layout.
+                if(widthScale<8.0 || heightScale<8.0) continue;
+
+                Frame replacement=(detection.Candidates??new List<Frame>())
+                    .Where(c=>c!=null && !object.ReferenceEquals(c,frame) && c.IsValid &&
+                        PointInsideLoose(c,new Point2d(main.CenterPoint.X,main.CenterPoint.Y)) &&
+                        c.Width>=main.Width*.80 && c.Height>=main.Height*.80 &&
+                        c.Width<=main.Width*4.0 && c.Height<=main.Height*4.0)
+                    .OrderByDescending(c=>c.Area).FirstOrDefault();
+
+                if(replacement==null)
+                    replacement=BuildPaperFrameAroundViewport(space,tr,main,mainForFrame,i);
+                if(replacement==null) continue;
+
+                double oldWidth=frame.Width,oldHeight=frame.Height;
+                frame.Center=replacement.Center;
+                frame.Width=replacement.Width;
+                frame.Height=replacement.Height;
+                frame.Angle=0;
+                frame.Outline=null;
+                frame.ContourArea=0;
+                frame.StrongOuterEvidence=true;
+                frame.IsValid=true;
+                frame.Decision="valid-paper-frame-scale-repaired";
+                EnsureFrameOutline(frame);
+                log.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                    "PAPER SCALE MISMATCH REPAIRED {0} / {1}: old={2:R}x{3:R} viewport={4:R}x{5:R} scale={6:0.###}x{7:0.###} new={8:R}x{9:R}",
+                    path,layoutName,oldWidth,oldHeight,main.Width,main.Height,
+                    widthScale,heightScale,frame.Width,frame.Height));
+            }
+        }
+
+        private static Frame BuildPaperFrameAroundViewport(BlockTableRecord space,Transaction tr,
+            Viewport main,List<Viewport> owners,int ownerIndex)
+        {
+            double left=main.CenterPoint.X-main.Width/2.0;
+            double right=main.CenterPoint.X+main.Width/2.0;
+            double bottom=main.CenterPoint.Y-main.Height/2.0;
+            double top=main.CenterPoint.Y+main.Height/2.0;
+            double searchX=main.Width*1.75,searchY=main.Height*1.75;
+            foreach(ObjectId id in space)
+            {
+                Entity entity=tr.GetObject(id,OpenMode.ForRead,false) as Entity;
+                if(entity==null || entity is Viewport || !entity.Visible || !EntityLayerVisible(entity,tr)) continue;
+                try
+                {
+                    Extents3d ext=entity.GeometricExtents;
+                    double ew=ext.MaxPoint.X-ext.MinPoint.X,eh=ext.MaxPoint.Y-ext.MinPoint.Y;
+                    if(ew<0 || eh<0 || ew>main.Width*4.0 || eh>main.Height*4.0) continue;
+                    double cx=(ext.MinPoint.X+ext.MaxPoint.X)/2.0;
+                    double cy=(ext.MinPoint.Y+ext.MaxPoint.Y)/2.0;
+                    if(Math.Abs(cx-main.CenterPoint.X)>searchX ||
+                       Math.Abs(cy-main.CenterPoint.Y)>searchY) continue;
+                    int nearest=-1;
+                    double nearestDistance=double.MaxValue;
+                    for(int j=0;j<owners.Count;j++)
+                    {
+                        Viewport owner=owners[j];
+                        if(owner==null) continue;
+                        double dx=(cx-owner.CenterPoint.X)/Math.Max(owner.Width,1e-9);
+                        double dy=(cy-owner.CenterPoint.Y)/Math.Max(owner.Height,1e-9);
+                        double distance=dx*dx+dy*dy;
+                        if(distance<nearestDistance) { nearestDistance=distance;nearest=j; }
+                    }
+                    if(nearest!=ownerIndex) continue;
+                    left=Math.Min(left,ext.MinPoint.X);right=Math.Max(right,ext.MaxPoint.X);
+                    bottom=Math.Min(bottom,ext.MinPoint.Y);top=Math.Max(top,ext.MaxPoint.Y);
+                }
+                catch { }
+            }
+            double width=right-left,height=top-bottom;
+            // A remote annotation must not recreate the same giant plot window.
+            // Fall back to the complete main viewport when the local union is not
+            // coherent; this is preferable to a page whose useful content is an
+            // unreadable speck.
+            if(width>main.Width*3.5 || height>main.Height*3.5 || width<=0 || height<=0)
+            {
+                left=main.CenterPoint.X-main.Width/2.0;right=main.CenterPoint.X+main.Width/2.0;
+                bottom=main.CenterPoint.Y-main.Height/2.0;top=main.CenterPoint.Y+main.Height/2.0;
+                width=main.Width;height=main.Height;
+            }
+            double pad=Math.Max(width,height)*.005;
+            return new Frame {
+                Center=new Point2d((left+right)/2.0,(bottom+top)/2.0),
+                Width=width+2*pad,Height=height+2*pad,Angle=0,
+                SourceDepth=0,Source="PaperViewportScaleRepair",IsValid=true,
+                Decision="valid-paper-viewport-scale-repair",StrongOuterEvidence=true,
+                IsPaperSpace=true
+            };
+        }
+
         private static double FrameIntersectionOverSmaller(Frame a,Frame b)
         {
             double aminX=a.Center.X-a.Width/2,amaxX=a.Center.X+a.Width/2;
@@ -2292,6 +2906,88 @@ namespace DwgBatchPdf
             return result;
         }
 
+        private static List<Frame> BuildStrictPaperSingleLineFrames(DetectionResult detection,
+            BlockTableRecord space,Transaction tr,Job job)
+        {
+            var result=new List<Frame>();
+            if(detection==null || detection.Candidates==null) return result;
+            var textMarks=new List<TextMark>();
+            CollectTextMarks(space,tr,Matrix3d.Identity,0,textMarks);
+            var eligible=new List<Frame>();
+            foreach(Frame candidate in detection.Candidates)
+            {
+                if(candidate==null || candidate.Width<job.MinFrameWidth ||
+                   candidate.Height<job.MinFrameHeight) continue;
+                string source=candidate.Source??string.Empty;
+                if(source.IndexOf("Contour",StringComparison.OrdinalIgnoreCase)<0 &&
+                   source.IndexOf("ClosedPolyline",StringComparison.OrdinalIgnoreCase)<0) continue;
+                double ratio=Math.Max(candidate.Width,candidate.Height)/
+                    Math.Max(1.0,Math.Min(candidate.Width,candidate.Height));
+                if(ratio<1.05 || ratio>4.50) continue;
+                if(job.MinFrameArea>0 && candidate.Area<job.MinFrameArea) continue;
+                if(job.MaxFrameArea>0 && candidate.Area>job.MaxFrameArea) continue;
+                int textCount=textMarks.Count(t=>PointInsideLoose(candidate,t.Position) &&
+                    !string.IsNullOrWhiteSpace(t.Text));
+                int entityCount=CountPaperEntitiesInsideFrame(space,tr,candidate);
+                // A single border is accepted only when it encloses substantial
+                // sheet content. This rejects title cells, tables and isolated
+                // equipment rectangles without reintroducing the old small-frame
+                // PDFs. A title signature is strong evidence but older drawings
+                // with exploded text may pass via the conservative count test.
+                bool titled=HasTitleSignature(candidate,textMarks);
+                if(!titled && (textCount<3 || entityCount<8)) continue;
+                if(CountNamedFrameLocatorsInside(space,tr,candidate)>1) continue;
+                eligible.Add(candidate);
+            }
+            foreach(Frame candidate in eligible.OrderByDescending(c=>c.Area))
+            {
+                if(result.Any(outer=>ContainsFrame(outer,candidate) ||
+                    FrameIntersectionOverSmaller(outer,candidate)>.55)) continue;
+                candidate.IsValid=true;
+                candidate.Decision="valid-paper-single-line-outer-fallback";
+                candidate.StrongOuterEvidence=true;
+                candidate.IsPaperSpace=true;
+                candidate.Outline=null;
+                candidate.ContourArea=0;
+                EnsureFrameOutline(candidate);
+                result.Add(candidate);
+            }
+            return result;
+        }
+
+        private static int CountPaperEntitiesInsideFrame(BlockTableRecord space,Transaction tr,Frame frame)
+        {
+            int count=0;
+            foreach(ObjectId id in space)
+            {
+                Entity entity=tr.GetObject(id,OpenMode.ForRead,false) as Entity;
+                if(entity==null || entity is Viewport || !entity.Visible || !EntityLayerVisible(entity,tr)) continue;
+                try
+                {
+                    Extents3d ext=entity.GeometricExtents;
+                    Point2d center=new Point2d((ext.MinPoint.X+ext.MaxPoint.X)/2.0,
+                        (ext.MinPoint.Y+ext.MaxPoint.Y)/2.0);
+                    if(PointInsideLoose(frame,center)) count++;
+                }
+                catch { }
+            }
+            return count;
+        }
+
+        private static int CountNamedFrameLocatorsInside(BlockTableRecord space,Transaction tr,Frame frame)
+        {
+            int count=0;
+            foreach(ObjectId id in space)
+            {
+                BlockReference block=tr.GetObject(id,OpenMode.ForRead,false) as BlockReference;
+                if(block==null || !block.Visible || !EntityLayerVisible(block,tr) ||
+                   !LooksLikeFrameName(GetBlockName(block,tr))) continue;
+                Point3d position=block.Position;
+                if(PointInsideLoose(frame,new Point2d(position.X,position.Y))) count++;
+            }
+            return count;
+        }
+
         private static double FrameOverlap(Frame a, Frame b)
         {
             if (AngleDifference(a.Angle,b.Angle)>.02) return 0;
@@ -2328,11 +3024,14 @@ namespace DwgBatchPdf
                     // simsun.ttc. Conversely an extensionless token such as
                     // O8116901 with no TypeFace is a missing custom CAD font, not
                     // an installed family.
-                    bool missingMain=hasTypeFace ? false : !FontExists(style.FileName,fontDirs);
+                    bool typeFaceInstalled=hasTypeFace && InstalledTypefaceExists(typeFace);
+                    bool fileBackedMain=FontExists(style.FileName,fontDirs);
+                    bool missingMain=hasTypeFace ? !typeFaceInstalled && !fileBackedMain : !fileBackedMain;
                     bool missingBig=!string.IsNullOrWhiteSpace(style.BigFontFileName) &&
                         !FontExists(style.BigFontFileName,fontDirs);
                     if(missingMain || missingBig) unresolvedStyleIds.Add(id);
-                    log.AppendLine("FONT STYLE name="+style.Name+" typeface="+typeFace+" main="+(style.FileName??"")+" ["+
+                    log.AppendLine("FONT STYLE name="+style.Name+" typeface="+typeFace+
+                        " typeface-installed="+typeFaceInstalled+" main="+(style.FileName??"")+" ["+
                         (missingMain?"MISSING":"FOUND")+"] big="+(style.BigFontFileName??"")+" ["+
                         (string.IsNullOrWhiteSpace(style.BigFontFileName)?"NONE":(missingBig?"MISSING":"FOUND"))+"]");
                     if(!missingMain && !missingBig) continue;
@@ -2345,9 +3044,10 @@ namespace DwgBatchPdf
                         // symbols rather than text and must remain SHX-backed.
                         if(!style.IsShapeFile)
                         {
-                            style.FileName="simsun.ttc";
+                            string fallback=AvailableFallbackTypeface();
+                            style.FileName=FallbackTypefaceFile(fallback);
                             style.BigFontFileName=string.Empty;
-                            style.Font=new Autodesk.AutoCAD.GraphicsInterface.FontDescriptor("宋体",false,false,134,0);
+                            style.Font=new Autodesk.AutoCAD.GraphicsInterface.FontDescriptor(fallback,false,false,134,0);
                         }
                         replacedMain++;
                     }
@@ -2357,9 +3057,10 @@ namespace DwgBatchPdf
                         // not compatible with gbcbig.shx). AutoCAD exposes the
                         // decoded text to .NET, so use a Unicode TTF fallback when
                         // the original BigFont is unavailable.
-                        style.FileName="simsun.ttc";
+                        string fallback=AvailableFallbackTypeface();
+                        style.FileName=FallbackTypefaceFile(fallback);
                         style.BigFontFileName=string.Empty;
-                        style.Font=new Autodesk.AutoCAD.GraphicsInterface.FontDescriptor("宋体",false,false,134,0);
+                        style.Font=new Autodesk.AutoCAD.GraphicsInterface.FontDescriptor(fallback,false,false,134,0);
                         replacedBig++;
                     }
                 }
@@ -2410,6 +3111,117 @@ namespace DwgBatchPdf
                 " replaced-inline="+replacedInline+" literal-question-mark-entities="+literalQuestions);
             if(literalQuestions>0)
                 log.AppendLine("WARN UNRECOVERABLE_LITERAL_QUESTION_MARK: source text already contains ??; substitution cannot reconstruct it.");
+        }
+
+        private static void RefreshFontGraphics(Database db,Editor editor,StringBuilder log)
+        {
+            int refreshed=0,failed=0;
+            try
+            {
+                using(Transaction tr=db.TransactionManager.StartTransaction())
+                {
+                    BlockTable blocks=(BlockTable)tr.GetObject(db.BlockTableId,OpenMode.ForRead);
+                    foreach(ObjectId blockId in blocks)
+                    {
+                        BlockTableRecord block=(BlockTableRecord)tr.GetObject(blockId,OpenMode.ForRead);
+                        if(block.IsFromExternalReference) continue;
+                        foreach(ObjectId entityId in block)
+                        {
+                            try
+                            {
+                                Entity entity=tr.GetObject(entityId,OpenMode.ForRead,false) as Entity;
+                                if(entity==null || !IsFontDependentEntity(entity)) continue;
+                                LayerTableRecord layer=(LayerTableRecord)tr.GetObject(entity.LayerId,OpenMode.ForRead);
+                                if(layer.IsLocked) continue;
+                                entity.UpgradeOpen();
+                                DBText text=entity as DBText;
+                                if(text!=null) text.AdjustAlignment(db);
+                                entity.RecordGraphicsModified(true);
+                                BlockReference blockReference=entity as BlockReference;
+                                if(blockReference!=null)
+                                {
+                                    foreach(ObjectId attributeId in blockReference.AttributeCollection)
+                                    {
+                                        AttributeReference attribute=tr.GetObject(attributeId,OpenMode.ForRead,false) as AttributeReference;
+                                        if(attribute==null) continue;
+                                        attribute.UpgradeOpen();
+                                        attribute.AdjustAlignment(db);
+                                        attribute.RecordGraphicsModified(true);
+                                    }
+                                }
+                                refreshed++;
+                            }
+                            catch { failed++; }
+                        }
+                    }
+                    tr.Commit();
+                }
+                try { db.UpdateExt(true); } catch { }
+                if(editor!=null)
+                {
+                    try { editor.Regen(); } catch(System.Exception ex) { log.AppendLine("WARN FONT REGEN "+ex.Message); }
+                }
+            }
+            catch(System.Exception ex)
+            {
+                log.AppendLine("WARN FONT GRAPHICS REFRESH "+ex.Message);
+            }
+            log.AppendLine("FONT GRAPHICS REFRESH refreshed="+refreshed+" failed="+failed);
+        }
+
+        private static bool IsFontDependentEntity(Entity entity)
+        {
+            return entity is DBText || entity is MText || entity is AttributeDefinition ||
+                entity is BlockReference || entity is Dimension || entity is MLeader || entity is Table;
+        }
+
+        private static string AvailableFallbackTypeface()
+        {
+            string[] preferred={"SimSun","Microsoft YaHei","Arial Unicode MS","Arial"};
+            foreach(string name in preferred) if(InstalledTypefaceExists(name)) return name;
+            return "Arial";
+        }
+
+        private static string FallbackTypefaceFile(string typeface)
+        {
+            if(string.Equals(typeface,"SimSun",StringComparison.OrdinalIgnoreCase)) return "simsun.ttc";
+            if(string.Equals(typeface,"Microsoft YaHei",StringComparison.OrdinalIgnoreCase)) return "msyh.ttc";
+            if(string.Equals(typeface,"Arial Unicode MS",StringComparison.OrdinalIgnoreCase)) return "arialuni.ttf";
+            return "arial.ttf";
+        }
+
+        private static bool InstalledTypefaceExists(string typeface)
+        {
+            if(string.IsNullOrWhiteSpace(typeface)) return false;
+            string wanted=NormalizeTypefaceName(typeface);
+            string[] registryPaths={
+                @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts",
+                @"SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Fonts"
+            };
+            foreach(string registryPath in registryPaths)
+            {
+                try
+                {
+                    using(Microsoft.Win32.RegistryKey key=Microsoft.Win32.Registry.LocalMachine.OpenSubKey(registryPath))
+                    {
+                        if(key==null) continue;
+                        foreach(string valueName in key.GetValueNames())
+                        {
+                            if(NormalizeTypefaceName(valueName).IndexOf(wanted,StringComparison.OrdinalIgnoreCase)>=0)
+                                return true;
+                        }
+                    }
+                }
+                catch { }
+            }
+            return false;
+        }
+
+        private static string NormalizeTypefaceName(string value)
+        {
+            if(string.IsNullOrWhiteSpace(value)) return string.Empty;
+            string result=Regex.Replace(value,@"\s*\((TrueType|OpenType|all res)\)\s*$",string.Empty,RegexOptions.IgnoreCase);
+            return Regex.Replace(result,@"[\s\-_]",string.Empty).Trim();
         }
 
         private static string ReplaceMissingInlineFonts(string contents,List<string> fontDirs,ref int replacedInline)
@@ -2966,6 +3778,12 @@ namespace DwgBatchPdf
                 s.Contains("图框") || s.Contains("标题栏") ||
                 Regex.IsMatch(s,@"(^|[-_$])TK[-_$]?(A[0-4])?($|[-_$])") ||
                 Regex.IsMatch(s,@"(^|[-_$])A[0-4][-_$(]");
+        }
+
+        private static bool IsAseriesFrameName(string s)
+        {
+            s=(s??string.Empty).ToUpperInvariant();
+            return Regex.IsMatch(s,@"(^|[^A-Z0-9])A[0-4]([^0-9]|$)");
         }
 
         private static double OverlapRatio(Extents2d a, Extents2d b)

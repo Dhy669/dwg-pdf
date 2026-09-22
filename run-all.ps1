@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$InputRoot = (Join-Path $PSScriptRoot 'RCJM1   MEP图纸汇总---20260617'),
   [string]$OutputRoot = (Join-Path $PSScriptRoot 'PDF输出_按原目录'),
   [double]$MinFrameArea = 0.0,

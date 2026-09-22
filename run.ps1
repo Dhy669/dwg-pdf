@@ -54,8 +54,19 @@ if (-not [string]::IsNullOrWhiteSpace($ExactFilePath)) {
 Get-CimInstance Win32_Process -Filter "Name='accoreconsole.exe'" -ErrorAction SilentlyContinue |
   ForEach-Object {
     $parent = Get-Process -Id $_.ParentProcessId -ErrorAction SilentlyContinue
-    if (-not $parent) {
-      Write-Warning "Ignoring orphaned accoreconsole.exe PID $($_.ProcessId); starting a new task."
+    $created = if ($_.CreationDate -is [datetime]) {
+      [datetime]$_.CreationDate
+    } else {
+      [Management.ManagementDateTimeConverter]::ToDateTime([string]$_.CreationDate)
+    }
+    $isOurStaleRuntime = -not $parent -and
+      $_.CommandLine -like '*DwgBatchPdfRuntime_*' -and
+      $created -lt (Get-Date).AddMinutes(-30)
+    if ($isOurStaleRuntime) {
+      Write-Warning "Stopping stale orphaned DWG-PDF core console PID $($_.ProcessId), started $created."
+      Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    } elseif (-not $parent) {
+      Write-Warning "Ignoring unrelated/recent orphaned accoreconsole.exe PID $($_.ProcessId); starting a new task."
     }
   }
 
@@ -106,6 +117,7 @@ $env:ACAD = if ([string]::IsNullOrWhiteSpace($env:ACAD)) {
   $runtimeFonts + ';' + $env:ACAD
 }
 $runtimeLog = Join-Path $runtime 'batch.log'
+$workspaceLog = Join-Path $bin 'batch.log'
 $consoleOut = Join-Path $runtime 'accoreconsole.out.log'
 $consoleErr = Join-Path $runtime 'accoreconsole.err.log'
 Remove-Item $runtimeLog -Force -ErrorAction SilentlyContinue
@@ -158,6 +170,7 @@ $quotedScript = '"' + (Join-Path $runtime 'run.scr') + '"'
 $completed = $false
 $coreExit = 1
 $timedOut = $false
+$lastReportedProgress = ''
 for ($attempt = 1; $attempt -le 2 -and -not $completed -and -not $timedOut; $attempt++) {
   Remove-Item $runtimeLog,$consoleOut,$consoleErr -Force -ErrorAction SilentlyContinue
   $core = Start-Process -FilePath (Join-Path $AcadDir 'accoreconsole.exe') `
@@ -187,6 +200,17 @@ for ($attempt = 1; $attempt -le 2 -and -not $completed -and -not $timedOut; $att
       $deadline = (Get-Date).AddMinutes($MaxMinutes)
     }
     if (Test-Path $runtimeLog) {
+      # Mirror the live plugin log to the stable workspace path. Atomic PDF
+      # publishing intentionally leaves the final output directory unchanged
+      # until every sheet succeeds, so this log is the visible progress source.
+      try { Copy-Item -LiteralPath $runtimeLog -Destination $workspaceLog -Force } catch { }
+      $progressLine = Get-Content -LiteralPath $runtimeLog -Tail 40 -ErrorAction SilentlyContinue |
+        Where-Object { $_ -match '^PLOT (START|COMPLETE) \[' } |
+        Select-Object -Last 1
+      if ($progressLine -and $progressLine -ne $lastReportedProgress) {
+        Write-Host $progressLine
+        $lastReportedProgress = $progressLine
+      }
       $completed = [bool](Select-String -LiteralPath $runtimeLog -Pattern '^Finished:' -Quiet)
       if ($completed) {
         Stop-Process -Id $core.Id -Force -ErrorAction SilentlyContinue
@@ -209,7 +233,6 @@ for ($attempt = 1; $attempt -le 2 -and -not $completed -and -not $timedOut; $att
     Start-Sleep -Seconds 3
   }
 }
-$workspaceLog = Join-Path $bin 'batch.log'
 if (Test-Path $runtimeLog) {
   Copy-Item $runtimeLog $workspaceLog -Force
 } else {
