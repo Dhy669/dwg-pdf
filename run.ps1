@@ -156,6 +156,7 @@ if ([IO.Path]::GetExtension($seed) -ne '.dwg') {
 # plugin still uses side databases when processing a different document.
 $quotedSeed = '"' + $seed + '"'
 $quotedScript = '"' + (Join-Path $runtime 'run.scr') + '"'
+$runStartedUtc = [DateTime]::UtcNow
 $completed = $false
 $coreExit = 1
 $timedOut = $false
@@ -247,5 +248,30 @@ if ($coreExit -eq 0 -and (Test-Path -LiteralPath $runtimeLog)) {
 }
 if ($coreExit -ne 0) { throw "accoreconsole failed with exit code $coreExit. See $workspaceLog" }
 if (-not (Test-Path $runtimeLog)) { throw "Plugin did not run; batch.log was not created." }
+# Final conservative blank-output guard. Only inspect PDFs written by this
+# invocation, so old files elsewhere under the shared output root are never
+# removed. 23 KB means exactly 23 * 1024 bytes.
+$minimumPdfBytes = 23KB
+$newPdfCutoffUtc = $runStartedUtc.AddSeconds(-5)
+$removedSmallPdfCount = 0
+Get-ChildItem -LiteralPath $OutputRoot -Recurse -File -Filter '*.pdf' -ErrorAction SilentlyContinue |
+  Where-Object { $_.LastWriteTimeUtc -ge $newPdfCutoffUtc -and $_.Length -lt $minimumPdfBytes } |
+  ForEach-Object {
+    $smallPdfPath = $_.FullName
+    $smallPdfBytes = $_.Length
+    try {
+      Remove-Item -LiteralPath $smallPdfPath -Force -ErrorAction Stop
+      $removedSmallPdfCount++
+      "REMOVE SMALL PDF bytes=$smallPdfBytes threshold=$minimumPdfBytes path=$smallPdfPath" |
+        Add-Content -LiteralPath $workspaceLog -Encoding UTF8
+      Write-Warning "Removed PDF smaller than 23 KB: $smallPdfPath ($smallPdfBytes bytes)"
+    } catch {
+      "FAILED TO REMOVE SMALL PDF bytes=$smallPdfBytes path=$smallPdfPath error=$($_.Exception.Message)" |
+        Add-Content -LiteralPath $workspaceLog -Encoding UTF8
+      Write-Warning "Could not remove small PDF: $smallPdfPath"
+    }
+  }
+"SMALL PDF FILTER threshold=$minimumPdfBytes removed=$removedSmallPdfCount" |
+  Add-Content -LiteralPath $workspaceLog -Encoding UTF8
 Write-Host "Done. Output: $OutputRoot"
 Write-Host "Log: $workspaceLog"
